@@ -95,6 +95,7 @@ public class IsoApplet extends Applet implements ExtendedLength {
     // GET VALUE P1 parameters:
     public static final byte OPT_P1_SERIAL = (byte) 0x01;
     public static final byte OPT_P1_MEM = (byte) 0x02;
+    public static final byte OPT_P1_INITCOUNTER = (byte) 0x03;
 
     // Status words:
     public static final short SW_PIN_TRIES_REMAINING = 0x63C0; // See ISO 7816-4 section 7.5.1
@@ -209,6 +210,7 @@ public class IsoApplet extends Applet implements ExtendedLength {
     private byte histBytes[] = null;
     private byte transport_key[] = null;
     private byte serial[] = null;
+    private short initCounter = 0;
 
     /**
      * \brief Sets default parameters (serial, etc).
@@ -785,6 +787,9 @@ public class IsoApplet extends Applet implements ExtendedLength {
                     // Set PUK (may be re-set during PIN creation)
                     puk.update(buf, offset_cdata, (byte)lc);
                     puk.resetAndUnblock();
+                    // Increment init counter
+                    if (initCounter < 32677)
+                        initCounter++;
                     state = STATE_INITIALISATION;
                 }
             }
@@ -839,6 +844,10 @@ public class IsoApplet extends Applet implements ExtendedLength {
 
                     fs.setUserAuthenticated(SOPIN_REF);
 
+                    // Increment init counter
+                    if (initCounter < 32677)
+                        initCounter++;
+
                     state = STATE_INITIALISATION;
 
                     ISOException.throwIt(ISO7816.SW_NO_ERROR);
@@ -865,6 +874,10 @@ public class IsoApplet extends Applet implements ExtendedLength {
             // Set PUK (may be re-set during PIN creation)
             puk.update(buf, offset_cdata, (byte)lc);
             puk.resetAndUnblock();
+
+            // Increment init counter
+            if (initCounter < 32677)
+                initCounter++;
 
             state = STATE_INITIALISATION;
         } else if(state == STATE_INITIALISATION) {
@@ -2563,6 +2576,16 @@ public class IsoApplet extends Applet implements ExtendedLength {
             buf[3] = (byte)(ram_chaining_cache[1] & 0xFF);
             apdu.setOutgoingLength((short) 4);
             apdu.sendBytes((short) 0, (short) 4);
+        } else if(p1 == OPT_P1_INITCOUNTER) {
+            // Get memory
+            short le = apdu.setOutgoing();
+            if(le < 2) {
+                ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
+            }
+            buf[0] = (byte)(initCounter >> 8);
+            buf[1] = (byte)(initCounter & 0xFF);
+            apdu.setOutgoingLength((short) 2);
+            apdu.sendBytes((short) 0, (short) 2);
         } else
             ISOException.throwIt(ISO7816.SW_INCORRECT_P1P2);
     }
