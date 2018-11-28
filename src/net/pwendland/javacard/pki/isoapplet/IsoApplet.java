@@ -791,6 +791,7 @@ public class IsoApplet extends Applet implements ExtendedLength {
                     // Set PUK (may be re-set during PIN creation)
                     puk.update(buf, offset_cdata, (byte)lc);
                     puk.resetAndUnblock();
+                    puk_is_set = true;
                     // Increment init counter
                     if (initCounter < 32677)
                         initCounter++;
@@ -845,6 +846,7 @@ public class IsoApplet extends Applet implements ExtendedLength {
                     // PUK should also be set, as it was cleared in ERASE_CARD, but we don't know the SO PIN
                     // puk.update(buf, offset_cdata, (byte)lc);
                     // puk.resetAndUnblock();
+                    // puk_is_set = true;
 
                     fs.setUserAuthenticated(SOPIN_REF);
 
