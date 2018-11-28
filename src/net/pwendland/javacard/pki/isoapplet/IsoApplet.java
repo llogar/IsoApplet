@@ -2464,17 +2464,19 @@ public class IsoApplet extends Applet implements ExtendedLength {
             ISOException.throwIt(ISO7816.SW_INCORRECT_P1P2);
         }
 
-        if( state != STATE_CREATION ) {
-            ISOException.throwIt(ISO7816.SW_CONDITIONS_NOT_SATISFIED);
+        if( state == STATE_CREATION || sopin.isValidated() ) {
+            // Check for new config
+            lc = apdu.setIncomingAndReceive();
+            if (lc > 0) {
+                if(lc != apdu.getIncomingLength()) {
+                    ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
+                }
+                setDefaultValues(buf, apdu.getOffsetCdata(), (byte)lc, false);
+            }
         }
 
-        // Check for new config
-        lc = apdu.setIncomingAndReceive();
-        if (lc > 0) {
-            if(lc != apdu.getIncomingLength()) {
-                ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
-            }
-            setDefaultValues(buf, apdu.getOffsetCdata(), (byte)lc, false);
+        if( state != STATE_CREATION ) {
+            ISOException.throwIt(ISO7816.SW_NO_ERROR);
         }
 
         /**
