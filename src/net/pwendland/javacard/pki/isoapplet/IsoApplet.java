@@ -127,6 +127,7 @@ public class IsoApplet extends Applet implements ExtendedLength {
     private static final short DEF_RSA_KEYLEN = KeyBuilder.LENGTH_RSA_2048;
 
     private static final byte ALG_GEN_RSA = (byte) 0xF3;
+    private static final byte ALG_RSA_PAD_NONE = (byte) 0x10;
     private static final byte ALG_RSA_PAD_PKCS1 = (byte) 0x11;
 
     private static final byte ALG_GEN_EC = (byte) 0xEC;
@@ -158,6 +159,7 @@ public class IsoApplet extends Applet implements ExtendedLength {
     private static final short API_FEATURE_ECDH = (short) 0x0020;
     private static final short API_FEATURE_IMPORT_EXPORT = (short) 0x0040;
     private static final short API_FEATURE_ENABLE_IMPORT_EXPORT = (short) 0x0080;
+    private static final short API_FEATURE_RSA_PAD_NONE = (short) 0x0100;
 
     /* Set to exclude IMPORT_EXPORT functionality at compile time */
     public static final boolean ENABLE_IMPORT_EXPORT = false;
@@ -270,6 +272,7 @@ public class IsoApplet extends Applet implements ExtendedLength {
     private Key[] keys = null;
     private byte[] ram_buf = null;
     private short[] ram_chaining_cache = null;
+    private Cipher rsaNoPadCipher = null;
     private Cipher rsaPkcs1Cipher = null;
     private Signature ecdsaSignatureSha1 = null;
     private Signature ecdsaSignaturePrecomp = null;
@@ -618,6 +621,8 @@ public class IsoApplet extends Applet implements ExtendedLength {
 
         currentPrivateKeyRef[0] = -1;
 
+        rsaNoPadCipher = Cipher.getInstance(Cipher.ALG_RSA_NOPAD, false);
+        api_features |= API_FEATURE_RSA_PAD_NONE;
         rsaPkcs1Cipher = Cipher.getInstance(Cipher.ALG_RSA_PKCS1, false);
 
         try {
@@ -1853,8 +1858,8 @@ public class IsoApplet extends Applet implements ExtendedLength {
                 ISOException.throwIt(ISO7816.SW_DATA_INVALID);
             }
 
-            // Supported signature algorithms: RSA with PKCS1 padding, ECDSA with raw input.
-            if(algRef == ALG_RSA_PAD_PKCS1) {
+            // Supported signature algorithms: RSA with or without PKCS1 padding, ECDSA with raw input.
+            if((algRef == ALG_RSA_PAD_NONE) || (algRef == ALG_RSA_PAD_PKCS1)) {
                 // Key reference must point to a RSA private key.
                 if(keys[privKeyRef].getType() != KeyBuilder.TYPE_RSA_CRT_PRIVATE) {
                     ISOException.throwIt(ISO7816.SW_DATA_INVALID);
@@ -1975,6 +1980,7 @@ public class IsoApplet extends Applet implements ExtendedLength {
      *						SW_WRONG_DATA
      */
     private void decipher(APDU apdu) {
+        RSAPrivateCrtKey rsaKey;
         short offset_cdata;
         short lc;
         short decLen = -1;
@@ -1990,19 +1996,42 @@ public class IsoApplet extends Applet implements ExtendedLength {
 
         switch(currentAlgorithmRef[0]) {
 
+        case ALG_RSA_PAD_NONE:
+            // Get the key - it must be an RSA private key,
+            // checks have been done in MANAGE SECURITY ENVIRONMENT.
+            rsaKey = (RSAPrivateCrtKey) keys[currentPrivateKeyRef[0]];
+
+            // Check the length of the cipher.
+            if(lc != (short)(rsaKey.getSize()/8)) {
+                ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
+            }
+
+            rsaNoPadCipher.init(rsaKey, Cipher.MODE_DECRYPT);
+            try {
+                decLen = rsaNoPadCipher.doFinal(ram_buf, (short)(offset_cdata+1), (short)(lc-1),
+                                                ram_buf, (short) 0);
+            } catch(CryptoException e) {
+                ISOException.throwIt(ISO7816.SW_WRONG_DATA);
+            }
+
+            // A single short APDU can handle only 256 bytes - we use sendLargeData instead
+            apdu.setOutgoing();
+            sendLargeData(apdu, (short)0, decLen);
+            break;
+
         case ALG_RSA_PAD_PKCS1:
             // Get the key - it must be an RSA private key,
             // checks have been done in MANAGE SECURITY ENVIRONMENT.
-            RSAPrivateCrtKey theKey = (RSAPrivateCrtKey) keys[currentPrivateKeyRef[0]];
+            rsaKey = (RSAPrivateCrtKey) keys[currentPrivateKeyRef[0]];
 
             // Check the length of the cipher.
             // Note: The first byte of the data field is the padding indicator
             //		 and therefor not part of the ciphertext.
-            if((short)(lc-1) !=  (short)(theKey.getSize() / 8)) {
+            if((short)(lc-1) !=  (short)(rsaKey.getSize() / 8)) {
                 ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
             }
 
-            rsaPkcs1Cipher.init(theKey, Cipher.MODE_DECRYPT);
+            rsaPkcs1Cipher.init(rsaKey, Cipher.MODE_DECRYPT);
             try {
                 decLen = rsaPkcs1Cipher.doFinal(ram_buf, (short)(offset_cdata+1), (short)(lc-1),
                                                 ram_buf, (short) 0);
@@ -2092,10 +2121,37 @@ public class IsoApplet extends Applet implements ExtendedLength {
         short offset_cdata;
         short lc;
         short sigLen = 0;
+        RSAPrivateCrtKey rsaKey;
         ECPrivateKey ecKey;
+        short keyLength;
         short le;
 
         switch(currentAlgorithmRef[0]) {
+        case ALG_RSA_PAD_NONE:
+
+            lc = doChainingOrExtAPDU(apdu);
+            offset_cdata = 0;
+
+            // RSA signature operation.
+            rsaKey = (RSAPrivateCrtKey) keys[currentPrivateKeyRef[0]];
+            keyLength = (short) (keys[currentPrivateKeyRef[0]].getSize() / 8);
+
+            if(lc != keyLength) {
+                ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
+            }
+
+            rsaNoPadCipher.init(rsaKey, Cipher.MODE_ENCRYPT);
+            sigLen = rsaNoPadCipher.doFinal(ram_buf, offset_cdata, lc, ram_buf, (short)0);
+
+            if(sigLen != keyLength) {
+                ISOException.throwIt(ISO7816.SW_UNKNOWN);
+            }
+
+            // A single short APDU can handle only 256 bytes - we use sendLargeData instead
+            apdu.setOutgoing();
+            sendLargeData(apdu, (short)0, sigLen);
+            break;
+
         case ALG_RSA_PAD_PKCS1:
             // Receive.
             // Bytes received must be Lc.
@@ -2106,8 +2162,8 @@ public class IsoApplet extends Applet implements ExtendedLength {
             offset_cdata = apdu.getOffsetCdata();
 
             // RSA signature operation.
-            RSAPrivateCrtKey rsaKey = (RSAPrivateCrtKey) keys[currentPrivateKeyRef[0]];
-            short keyLength = (short) (keys[currentPrivateKeyRef[0]].getSize() / 8);
+            rsaKey = (RSAPrivateCrtKey) keys[currentPrivateKeyRef[0]];
+            keyLength = (short) (keys[currentPrivateKeyRef[0]].getSize() / 8);
 
             if(lc > (short) (keyLength - 9)) {
                 ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
