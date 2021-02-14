@@ -3196,16 +3196,19 @@ public class IsoApplet extends Applet implements ExtendedLength {
             ISOException.throwIt(ISO7816.SW_FUNC_NOT_SUPPORTED);
         }
 
+        doChainingOrExtAPDU(apdu);
+
         if(p1 != 0x00 || p1 != 0x00) {
             ISOException.throwIt(ISO7816.SW_INCORRECT_P1P2);
         }
+
+        // A single short APDU can handle only 256 bytes - we use sendLargeData instead
         short le = apdu.setOutgoing();
-        if(le <= 0 || le > 256) {
+        if(le <= 0 || le > ram_buf.length) {
             ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
         }
-        randomData.generateData(buf, (short)0, le);
-        apdu.setOutgoingLength(le);
-        apdu.sendBytes((short)0, le);
+        randomData.generateData(ram_buf, (short)0, le);
+        sendLargeData(apdu, (short)0, le);
     }
 
     /**
