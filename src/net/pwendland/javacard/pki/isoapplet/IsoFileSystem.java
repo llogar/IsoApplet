@@ -22,6 +22,8 @@ package net.pwendland.javacard.pki.isoapplet;
 import javacard.framework.*;
 
 import net.pwendland.javacard.pki.isoapplet.UtilTLV;
+import net.pwendland.javacard.pki.isoapplet.IsoApplet;
+import javacard.security.Key;
 
 /**
  * \brief The ISO 7816 compliant IsoFileSystem class.
@@ -49,6 +51,7 @@ public class IsoFileSystem extends DedicatedFile {
     private Object[] currentlySelectedFiles = null;
     short currentRecordNum;
     private boolean[] isUserAuthenticated = null;
+    private boolean fused = false;
 
 
     /**
@@ -160,6 +163,10 @@ public class IsoFileSystem extends DedicatedFile {
      * files.
      */
     public void setUserAuthenticated(byte pin) {
+        // Only 1 PIN in SC-HSM mode
+        if (IsoApplet.SCHSM) {
+            pin = 0;
+        }
         if (pin >= 0 && pin < MAX_PINS)
             this.isUserAuthenticated[pin] = true;
     }
@@ -292,6 +299,43 @@ public class IsoFileSystem extends DedicatedFile {
         return;
     }
 
+    /**
+     * \brief Resize existing EFTransparent
+     *
+     * \param file A reference of the file to save.
+     *
+     * \param size A new size
+     *
+     * \throw NotEnoughSpaceException
+     */
+    public ElementaryFileTransparent resizeFile(ElementaryFileTransparent file, short size) throws NotEnoughSpaceException {
+        DedicatedFile parent;
+        ElementaryFileTransparent newFile;
+        byte[] data;
+        byte[] newData;
+
+        data = file.getData();
+        if (data.length > size) {
+            return file;
+        }
+
+        newData = new byte[size];
+        Util.arrayCopy(data, (short)0, newData, (short)0, (short)data.length);
+        newFile = new ElementaryFileTransparent(file.getFileID(), buildFCI(file.getFileID(), (short)newData.length), newData);
+
+        if (currentlySelectedFiles[OFFSET_CURRENT_EF] == file) {
+            currentlySelectedFiles[OFFSET_CURRENT_EF] = newFile;
+        }
+
+        try {
+            getCurrentlySelectedDF().deleteChildren(file.getFileID());
+        } catch (NotFoundException e) {
+        }
+
+        addFile(newFile);
+
+        return newFile;
+    }
 
     /**
      * \brief "Safely" instantiate a File according to the provided File Control Information.
@@ -526,6 +570,11 @@ public class IsoFileSystem extends DedicatedFile {
         short fid;
         File fileToSelect = null;
 
+        // SC_HSM only support p1 == 0x00
+        if (IsoApplet.SCHSM && p1 != 0x00) {
+            ISOException.throwIt(ISO7816.SW_INCORRECT_P1P2);
+        }
+
         // Only "first or only occurence" supported at the moment (ISO 7816-4 Table 40).
         if((p2 & 0xF3) != 0x00) {
             ISOException.throwIt(ISO7816.SW_INCORRECT_P1P2);
@@ -648,6 +697,92 @@ public class IsoFileSystem extends DedicatedFile {
     }
 
     /**
+     * \brief Process the READ BINARY APDU in SC-HSM mode
+     *
+     * \param apdu The APDU (INS=B0).
+     *
+     * \throw ISOException SW_WRONG_LENGTH, SW_FILE_NOT_FOUND, SW_SECURITY_STATUS_NOT_SATISFIED, SW_DATA_INVALID
+     *			SW_COMMAND_INCOMPATIBLE_WITH_FILE_STRUCTURE
+     */
+    public void processReadBinarySCHSM(APDU apdu) {
+        byte[] buf = apdu.getBuffer();
+        byte p1 = buf[ISO7816.OFFSET_P1];
+        byte p2 = buf[ISO7816.OFFSET_P2];
+        short lc, rl;
+        short offset_cdata;
+        short pos, len;
+        short offset = 0;
+
+        rl = apdu.setIncomingAndReceive();
+        lc = apdu.getIncomingLength();
+        // Expect only tag 0x54(offset)
+        if ((rl != lc) || (lc != 4)) {
+            ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
+        }
+        offset_cdata = apdu.getOffsetCdata();
+
+        ElementaryFile ef = null;
+        short fid = Util.makeShort(p1, p2);
+
+        try {
+            ef = fid != 0 ? getCurrentlySelectedDF().findChildElementaryFile(fid) : (ElementaryFile)currentlySelectedFiles[OFFSET_CURRENT_EF];
+        } catch(NotFoundException e) {
+            ef = null;
+        }
+        if (ef == null) {
+            ISOException.throwIt(ISO7816.SW_FILE_NOT_FOUND);
+        }
+
+        // files with file ID 0xCDxx are PIN protected
+        if ((ef.getFileID() & (short)0xFF00) == (short)0xCD00) {
+            if (!isUserAuthenticated[0]) {
+                ISOException.throwIt(ISO7816.SW_SECURITY_STATUS_NOT_SATISFIED);
+            }
+        };
+
+        // Read offset
+        try {
+            pos = UtilTLV.findTag(buf, offset_cdata, lc, (byte) 0x54);
+            len = UtilTLV.decodeLengthField(buf, ++pos);
+            if (len != 2) {
+                throw InvalidArgumentsException.getInstance();
+            }
+            pos += UtilTLV.getLengthFieldLength(len);
+            offset = Util.getShort(buf, pos);
+        } catch (Exception e) {
+            ISOException.throwIt(ISO7816.SW_DATA_INVALID);
+        }
+
+        // EF to read from must be transparent.
+        ElementaryFileTransparent efTr = null;
+        if(ef instanceof ElementaryFileTransparent) {
+            efTr = (ElementaryFileTransparent) ef;
+        } else {
+            ISOException.throwIt(SW_COMMAND_INCOMPATIBLE_WITH_FILE_STRUCTURE);
+        }
+        byte[] fileData = efTr.getData();
+
+        // EOF?
+        if(offset == fileData.length) {
+            ISOException.throwIt(ISO7816.SW_NO_ERROR);
+        }
+
+        // Offset in bounds?
+        if( (offset > fileData.length)
+                || (offset < 0) ) {
+            ISOException.throwIt(SW_OFFSET_OUTSIDE_EF);
+        }
+
+        // Le: Length of expected data (i.e. max length of data to read).
+        short le = apdu.setOutgoing();
+        if ((short)(offset + le) > (short)fileData.length) {
+            le = (short)(fileData.length - offset);
+        }
+        apdu.setOutgoingLength(le);
+        apdu.sendBytesLong(fileData, offset, le);
+    }
+
+    /**
      * \brief Process the READ BINARY APDU.
      *
      * \param apdu The APDU (INS=B0).
@@ -662,7 +797,8 @@ public class IsoFileSystem extends DedicatedFile {
 
         // Check INS: We only support INS=B0 at the moment.
         if(buf[ISO7816.OFFSET_INS] == (byte) 0xB1) {
-            ISOException.throwIt(ISO7816.SW_FUNC_NOT_SUPPORTED);
+            processReadBinarySCHSM(apdu);
+            return;
         }
 
         // Check P1 and P2.
@@ -767,6 +903,133 @@ public class IsoFileSystem extends DedicatedFile {
 // TODO WRITE BINARY If file lifecycles are to be implemented.
 
     /**
+     * \Brief Process the UPDATE BINARY apdu in SC-HSM mode
+     *
+     * \param apdu The APDU (INS=D6).
+     *
+     * \throw ISOException SW_SECURITY_STATUS_NOT_SATISFIED, SW_WRONG_LENGTH, SW_COMMAND_NOT_ALLOWED, SW_SECURITY_STATUS_NOT_SATISFIED
+     +			SW_DATA_INVALID, SW_FILE_FULL, SW_COMMAND_INCOMPATIBLE_WITH_FILE_STRUCTURE
+     */
+    public void processUpdateBinarySCHSM(APDU apdu) {
+        byte[] buf = apdu.getBuffer();
+        byte p1 = buf[ISO7816.OFFSET_P1];
+        byte p2 = buf[ISO7816.OFFSET_P2];
+        short lc, rl;
+        short offset_cdata;
+        short pos = 0, len;
+        short offset = 0;
+        short length = 0;
+
+        // Always request PIN on UPDATE BINARY
+        if (!isUserAuthenticated[0]) {
+            ISOException.throwIt(ISO7816.SW_SECURITY_STATUS_NOT_SATISFIED);
+        }
+
+        rl = apdu.setIncomingAndReceive();
+        lc = apdu.getIncomingLength();
+        // At least 6 bytes need to be read to get tags 0x54(offset) and 0x53(length) - 00 D7 xx xx 06 54 02 00 00 53 00
+        if(rl < 6) {
+            ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
+        }
+        offset_cdata = apdu.getOffsetCdata();
+
+        ElementaryFile ef = null;
+        short fid = Util.makeShort(p1, p2);
+
+        try {
+            ef = fid != 0 ? getCurrentlySelectedDF().findChildElementaryFile(fid) : (ElementaryFile)currentlySelectedFiles[OFFSET_CURRENT_EF];
+        } catch(NotFoundException e) {
+            ef = null;
+        }
+
+        if (ef != null) {
+            fid = ef.getFileID();
+        }
+
+        // This file can not be rewritten
+        if (fid == 0x2F02 && fused) {
+            ISOException.throwIt(ISO7816.SW_COMMAND_NOT_ALLOWED);
+        }
+
+        // Files 0xCDxx are PIN protected
+        if ((fid & (short)0xFF00) == (short)0xCD00) {
+            if (!isUserAuthenticated[0]) {
+                ISOException.throwIt(ISO7816.SW_SECURITY_STATUS_NOT_SATISFIED);
+            }
+        };
+
+        try {
+            pos = offset_cdata;
+
+            // Read tag 0x54 - offset, always 2 bytes
+            pos = UtilTLV.findTag(buf, pos, rl, (byte) 0x54);
+            len = UtilTLV.decodeLengthField(buf, ++pos);
+            if (len != 2) {
+                throw InvalidArgumentsException.getInstance();
+            }
+            pos += UtilTLV.getLengthFieldLength(len);
+            offset = Util.getShort(buf, pos);
+            pos += len;
+
+            // Read tag 0x53
+            pos = UtilTLV.findTag(buf, pos, rl, (byte) 0x53);
+            length = buf[++pos] == 0 ? 0 : UtilTLV.decodeLengthField(buf, pos);
+            pos += UtilTLV.getLengthFieldLength(length);
+
+            // Max file size is 32767
+            if ((short)(offset + length) < (short)0) {
+                throw InvalidArgumentsException.getInstance();
+            }
+        } catch (Exception e) {
+            ISOException.throwIt(ISO7816.SW_DATA_INVALID);
+        }
+
+        // Adjust data size still in read buffer
+        rl -= (pos - offset_cdata);
+        lc -= (pos - offset_cdata);
+        // More data in buffer than we need it -> abort
+        if (length < rl) {
+            ISOException.throwIt(ISO7816.SW_DATA_INVALID);
+        }
+
+        if (ef == null) {
+            try {
+                ef = new ElementaryFileTransparent(fid, buildFCI(fid, length), new byte[length]);
+                addFile(ef);
+                selectFile(ef);
+            } catch (NotEnoughSpaceException e) {
+                ISOException.throwIt(ISO7816.SW_FILE_FULL);
+            }
+        }
+
+        // EF to update must be transparent.
+        ElementaryFileTransparent efTr = null;
+        if(ef instanceof ElementaryFileTransparent) {
+            efTr = (ElementaryFileTransparent) ef;
+        } else {
+            ISOException.throwIt(SW_COMMAND_INCOMPATIBLE_WITH_FILE_STRUCTURE);
+        }
+        byte[] fileData = efTr.getData();
+
+        if ((short)(offset + length) > (short)(fileData.length)) {
+            try {
+                efTr = resizeFile(efTr, (short)(offset + length));
+                fileData = efTr.getData();
+            } catch (NotEnoughSpaceException e) {
+                ISOException.throwIt(ISO7816.SW_FILE_FULL);
+            }
+        }
+
+        // Process whole extended apdu
+        Util.arrayCopy(buf, pos, fileData, offset, rl);
+        for (pos = rl; pos < lc; pos += rl) {
+            rl = apdu.receiveBytes((short)0);
+            Util.arrayCopy(buf, (short)0, fileData, (short)(offset + pos), rl);
+        }
+        // Done
+    }
+
+    /**
      * \Brief Process the UPDATE BINARY apdu.
      *
      * This method updates data already present in a transparent EF. The APDU specifies an
@@ -788,7 +1051,8 @@ public class IsoFileSystem extends DedicatedFile {
 
         // Check INS: We only support INS=D6 at the moment.
         if(buf[ISO7816.OFFSET_INS] == (byte) 0xD7) {
-            ISOException.throwIt(ISO7816.SW_FUNC_NOT_SUPPORTED);
+            processUpdateBinarySCHSM(apdu);
+            return;
         }
 
         // Bytes received must be Lc.
@@ -858,6 +1122,96 @@ public class IsoFileSystem extends DedicatedFile {
     /* ISO 7816-9 */
 
     /**
+     * \brief Process the DELETE FILE apdu in SC-HSM mode
+     *
+     * \param apdu The DELETE FILE apdu.
+     *
+     * \throw ISOException SW_INCORRECT_P1P2, SW_WRONG_LENGTH, SW_SECURITY_STATUS_NOT_SATISFIED, SW_COMMAND_NOT_ALLOWED,
+     * SW_DATA_INVALID and SW_FILE_NOT_FOUND
+     */
+    public void processDeleteFileSCHSM(APDU apdu, Key[] keys) {
+        byte[] buf = apdu.getBuffer();
+        byte p1 = buf[ISO7816.OFFSET_P1];
+        byte p2 = buf[ISO7816.OFFSET_P2];
+        short lc;
+        short offset_cdata;
+        short fileID;
+        File fileToDelete = null;
+
+        // Only P1P2 = 0200 is currently supported.
+        // (File identifier must be encoded in the command data field.)
+        if( p1 != 0x02 || p2 != 0x00 ) {
+            ISOException.throwIt(ISO7816.SW_INCORRECT_P1P2);
+        }
+
+        // Bytes received must be Lc.
+        lc = apdu.setIncomingAndReceive();
+        if(lc != apdu.getIncomingLength()) {
+            ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
+        }
+        offset_cdata = apdu.getOffsetCdata();
+
+        // One FID in DATA.
+        if(lc != 2) {
+            ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
+        }
+
+        if (!isUserAuthenticated[0]) {
+            ISOException.throwIt(ISO7816.SW_SECURITY_STATUS_NOT_SATISFIED);
+        }
+
+        // Find the File.
+        fileID = Util.getShort(buf, offset_cdata);
+
+        // This file can not be deleted
+        if (fileID == 0x2F02 && fused) {
+            ISOException.throwIt(ISO7816.SW_COMMAND_NOT_ALLOWED);
+        }
+
+        // Check if we are deleting private key 
+        if ((short)(fileID & (short)0xFF00) == (short)0xCC00) {
+            byte privKeyRef = (byte)(fileID & 0xFF);
+            try {
+                if (keys[privKeyRef] == null) {
+                    throw InvalidArgumentsException.getInstance();
+                }
+                if(keys[privKeyRef].isInitialized()) {
+                     keys[privKeyRef].clearKey();
+                }
+                keys[privKeyRef] = null;
+            } catch (InvalidArgumentsException e) {
+                ISOException.throwIt(ISO7816.SW_DATA_INVALID);
+            } catch (ArrayIndexOutOfBoundsException e) {
+                ISOException.throwIt(ISO7816.SW_DATA_INVALID);
+            }
+            return;
+        }
+
+        try {
+            fileToDelete = findFile(fileID, SPECIFY_ANY);
+        } catch (NotFoundException e) {
+            ISOException.throwIt(ISO7816.SW_FILE_NOT_FOUND);
+        }
+
+        // Don't delete the MF.
+        if(fileToDelete == this) {
+            ISOException.throwIt(ISO7816.SW_COMMAND_NOT_ALLOWED);
+        }
+
+        // Update current DF before deletion.
+        currentlySelectedFiles[OFFSET_CURRENT_DF] = (fileToDelete.getParentDF());
+        currentlySelectedFiles[OFFSET_CURRENT_EF] = null;
+
+        // Remove from tree. Garbage collector has already been called by deleteChildren().
+        try {
+            getCurrentlySelectedDF().deleteChildren(fileID);
+        } catch(NotFoundException e) {
+            ISOException.throwIt(ISO7816.SW_FILE_NOT_FOUND);
+        }
+
+    }
+
+    /**
      * \brief Process the DELETE FILE apdu.
      *
      * \attention Only deletion by FID is supported. Lc must be 2, the DATA field
@@ -870,7 +1224,7 @@ public class IsoFileSystem extends DedicatedFile {
      * \throw ISOException SW_INCORRECT_P1P2, SW_WRONG_LENGTH, SW_FILE_NOT_FOUND and
      *			SW_SECURITY_STATUS_NOT_SATISFIED.
      */
-    public void processDeleteFile(APDU apdu) throws ISOException {
+    public void processDeleteFile(APDU apdu, Key[] keys) throws ISOException {
         byte[] buf = apdu.getBuffer();
         byte p1 = buf[ISO7816.OFFSET_P1];
         byte p2 = buf[ISO7816.OFFSET_P2];
@@ -878,6 +1232,11 @@ public class IsoFileSystem extends DedicatedFile {
         short offset_cdata;
         short fileID;
         File fileToDelete = null;
+
+        if(IsoApplet.SCHSM) {
+            processDeleteFileSCHSM(apdu, keys);
+            return;
+        }
 
         // Only P1P2 = 0000 is currently supported.
         // (File identifier must be encoded in the command data field.)
@@ -977,6 +1336,123 @@ public class IsoFileSystem extends DedicatedFile {
         }
 
         return;
+    }
+
+    /**
+     * \brief Returns a list of all files including dummy CCxx private key files
+     */
+    public void processEnumerateObjects(APDU apdu, Key[] keys) {
+        byte[] buf = apdu.getBuffer();
+        byte p1 = buf[ISO7816.OFFSET_P1];
+        byte p2 = buf[ISO7816.OFFSET_P2];
+        short lc, le;
+        short offset_cdata;
+        short cnt;
+
+        // Only P1P2 = 0000 supported.
+        if( p1 != 0x00 || p2 != 0x00 ) {
+            ISOException.throwIt(ISO7816.SW_INCORRECT_P1P2);
+        }
+
+        // Bytes received must be Lc.
+        lc = apdu.setIncomingAndReceive();
+        if(lc != apdu.getIncomingLength()) {
+            ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
+        }
+        offset_cdata = apdu.getOffsetCdata();
+
+        try {
+            cnt = getChildrenCount();
+            le = apdu.setOutgoing();
+            // Check for overflow
+//            if (le < (short)(cnt*2)) {
+//                ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
+//            }
+            // Iterate FileIDs
+            le = 0;
+            for (byte n = 0; n < cnt; n++) {
+                short fid = getChildren(n).getFileID();
+                buf[le++] = (byte)(fid >> 8);
+                buf[le++] = (byte)(fid & 0xFF);
+            }
+
+            for (short n = 0; n < keys.length; n++) {
+                if (keys[n] != null) {
+                    buf[le++] = (byte) 0xCC;
+                    buf[le++] = (byte) n;
+                }
+            }
+
+            apdu.setOutgoingLength(le);
+            apdu.sendBytes((short) 0, le);
+        } catch (Exception e) {
+            ISOException.throwIt(ISO7816.SW_UNKNOWN);
+        }
+    }
+
+    /**
+     * \brief Create a minimal FCI containing fileID, file type and length
+     */
+    private byte[] buildFCI(short fileID, short length) {
+        byte[] fci = new byte[13];
+        try {
+            // FCI tag 0x6F
+            UtilTLV.writeTagAndLen((short)0x6F, (short)0x0B, fci, (short)0);
+            // tag 0x80 - file length
+            UtilTLV.writeTagAndLen((short)0x80, (short)0x02, fci, (short)2);
+            Util.setShort(fci, (short)4, length);
+            // tag 0x82 - ordinary file (0x01)
+            UtilTLV.writeTagAndLen((short)0x82, (short)0x01, fci, (short)6);
+            fci[8] = (byte)0x01;
+            // tag 0x83 - file ID
+            UtilTLV.writeTagAndLen((short)0x83, (short)0x02, fci, (short)9);
+            Util.setShort(fci, (short)11, fileID);
+        } catch (Exception e) {
+        }
+        return fci;
+    }
+
+    /**
+     * \brief Return contects of file 2F02
+     */
+    public byte[] get2F02() {
+        byte[] data = null;
+        try {
+            ElementaryFileTransparent efTr = (ElementaryFileTransparent)getCurrentlySelectedDF().findChildElementaryFile((short)0x2F02);
+            data = efTr.getData();
+        } catch (NotFoundException e) {
+        }
+        return data;
+    }
+
+    /**
+     * \brief Add file 2F02
+     */
+    public void add2F02(byte[] data) {
+        try {
+            byte newData[] = new byte[data.length];
+            Util.arrayCopy(data, (short) 0, newData, (short) 0, (short) data.length);
+            addFile(new ElementaryFileTransparent((short)0x2F02, buildFCI((short)0x2F02, (short)newData.length), newData));
+            fused = true;
+        } catch (NotEnoughSpaceException e) {
+            ISOException.throwIt(ISO7816.SW_FILE_FULL);
+        }
+
+    }
+
+    /**
+     * \brief Replace file 2F02 with a new one
+     */
+    public void set2F02(byte[] data) {
+        try {
+            ElementaryFileTransparent efTr = (ElementaryFileTransparent)getCurrentlySelectedDF().findChildElementaryFile((short)0x2F02);
+            byte[] fileData = efTr.getData();
+            Util.arrayFillNonAtomic(fileData, (short)0, (short)fileData.length, (byte)0);
+            efTr.getParentDF().deleteChildren((short)0x2F02);
+        } catch (NotFoundException e) {
+            ISOException.throwIt(ISO7816.SW_UNKNOWN);
+        }
+        add2F02(data);
     }
 
 // TODO If file lifecycles are to be implemented:
