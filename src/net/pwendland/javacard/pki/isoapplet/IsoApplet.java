@@ -156,6 +156,14 @@ public class IsoApplet extends Applet implements ExtendedLength {
     private static final short API_FEATURE_RSA_4096 = (short) 0x0008;
     private static final short API_FEATURE_ECDSA_PRECOMPUTED_HASH = (short) 0x0010;
     private static final short API_FEATURE_ECDH = (short) 0x0020;
+    private static final short API_FEATURE_IMPORT_EXPORT = (short) 0x0040;
+    private static final short API_FEATURE_ENABLE_IMPORT_EXPORT = (short) 0x0080;
+
+    /* Set to exclude IMPORT_EXPORT functionality at compile time */
+    public static final boolean ENABLE_IMPORT_EXPORT = false;
+
+    /* Support for card backup/restore */
+    private boolean IMPORT_EXPORT = false;
 
     /* Other constants */
     // "ram_buf" is used for:
@@ -188,6 +196,7 @@ public class IsoApplet extends Applet implements ExtendedLength {
     private static final short RSA_TAG_96 = (short)0x0010;
     private static final short TAG_ALL    = (short)0x003F;
 
+    private static final short TAG_CONFIG = (short)0xCF;
     private static final byte TAG_PIN_MAX_TRIES = (byte)0x01;
     private static final byte TAG_PUK_MUST_BE_SET = (byte)0x02;
     private static final byte TAG_ENABLE_KEY_IMPORT = (byte)0x03;
@@ -198,13 +207,64 @@ public class IsoApplet extends Applet implements ExtendedLength {
     private static final byte TAG_HISTBYTES = (byte)0x08;
     private static final byte TAG_TRANSPORT_KEY = (byte)0x09;
     private static final byte TAG_SERIAL = (byte)0x0A;
+    private static final byte TAG_IMPORT_EXPORT = (byte)0x0B;
+    private static final byte TAG_API_FEATURES = (byte)0x0C;
+    private static final byte TAG_INITCOUNT = (byte)0x0D;
+    private static final byte TAG_STATE = (byte)0x0E;
+    private static final byte TAG_PIN = (byte)0x0F;
+    private static final byte TAG_PUK = (byte)0x10;
+    private static final byte TAG_SOPIN = (byte)0x11;
+
+    /**
+     * \brief OwnerPIN that can return pin value via copyPIN()
+     */
+    class OwnerPINexp extends OwnerPIN {
+        private byte val[] = null;
+        public OwnerPINexp(byte tryLimit, byte maxPINSize) {
+            super(tryLimit, maxPINSize);
+            if (ENABLE_IMPORT_EXPORT) {
+                if (IMPORT_EXPORT) {
+                    val = new byte[maxPINSize];
+                }
+            }
+        }
+        public void update(byte[] pin, short offset, byte length) {
+            super.update(pin, offset, length);
+            if (ENABLE_IMPORT_EXPORT) {
+                if (val != null) {
+                    Util.arrayCopy(pin, offset, val, (short)0, length);
+                }
+            }
+        }
+        public short copyPIN(byte[] pin, short offset) {
+            if (ENABLE_IMPORT_EXPORT) {
+                return (short)(Util.arrayCopy(val, (short)0, pin, offset, (short)val.length) - offset);
+            } else {
+                return (short)0;
+            }
+        }
+        public boolean check() {
+            if (ENABLE_IMPORT_EXPORT) {
+                if (val != null) {
+                    return super.check(val, (short)0, (byte)val.length);
+                }
+            }
+            return false;
+        }
+        public void clear() {
+            if (val != null) {
+                Util.arrayFillNonAtomic(val, (short)0, (short)val.length, (byte)0x00);
+                val = null;
+            }
+        }
+    }
 
     /* Member variables: */
     private byte state = STATE_CREATION;
     private IsoFileSystem fs = null;
-    private OwnerPIN pin = null;
-    private OwnerPIN puk = null;
-    private OwnerPIN sopin = null;
+    private OwnerPINexp pin = null;
+    private OwnerPINexp puk = null;
+    private OwnerPINexp sopin = null;
     private byte[] currentAlgorithmRef = null;
     private short[] currentPrivateKeyRef = null;
     private Key[] keys = null;
@@ -256,6 +316,15 @@ public class IsoApplet extends Applet implements ExtendedLength {
             Lc = bArray[(short)(bOffset + Li + 1)];
             La = bArray[(short)(bOffset + Li + Lc + 2)];
             bOff = (short)(bOffset + Li + Lc + 3);
+            // Ignore CF tag for backward compatibility
+            try {
+                pos = UtilTLV.findTag(bArray, bOff, La, (byte)TAG_CONFIG);
+                len = UtilTLV.decodeLengthField(bArray, ++pos);
+                pos += UtilTLV.getLengthFieldLength(len);
+                bOff = pos;
+                La = (byte)len;
+            } catch (Exception e) {
+            }
         } else {
             La = bLength;
             bOff = bOffset;
@@ -283,41 +352,19 @@ public class IsoApplet extends Applet implements ExtendedLength {
             return;
         }
         try {
-            if (bInit) {
+            if (!ENABLE_IMPORT_EXPORT) {
+                IMPORT_EXPORT = false;
+            } else if (bInit || IMPORT_EXPORT) {
                 try {
-                    pos = UtilTLV.findTag(bArray, bOff, La, TAG_SERIAL);
+                    pos = UtilTLV.findTag(bArray, bOff, La, TAG_IMPORT_EXPORT);
                     len = UtilTLV.decodeLengthField(bArray, ++pos);
-                    if(len > MAX_SERIAL_LEN) {
+                    if(len != 1) {
                         throw InvalidArgumentsException.getInstance();
                     }
-                    serial = new byte[len];
-                    Util.arrayCopyNonAtomic(bArray, ++pos, serial, (short) 0, len);
+                    IMPORT_EXPORT = GPSystem.getCardState() != GPSystem.CARD_SECURED ? bArray[++pos] != 0 : false;
                 } catch (NotFoundException e) {
-                    serial = new byte[4];
-                    RandomData.getInstance(RandomData.ALG_SECURE_RANDOM).generateData(serial, (short)0, (short)4);
+                    IMPORT_EXPORT = false;
                 }
-                try {
-                    pos = UtilTLV.findTag(bArray, bOff, La, TAG_HISTBYTES);
-                    len = UtilTLV.decodeLengthField(bArray, ++pos);
-                    if(len > MAX_HISTBYTES_LEN) {
-                       throw InvalidArgumentsException.getInstance();
-                    }
-                    histBytes = new byte[len];
-                    Util.arrayCopyNonAtomic(bArray, ++pos, histBytes, (short) 0, len);
-                    histBytesSet = false;
-                } catch (NotFoundException e) {
-                    histBytes = null;
-                }
-            }
-            try {
-                pos = UtilTLV.findTag(bArray, bOff, La, TAG_KEY_MAX_COUNT);
-                len = UtilTLV.decodeLengthField(bArray, ++pos);
-                if(len != 1) {
-                   throw InvalidArgumentsException.getInstance();
-                }
-                key_max_count = bArray[++pos];
-            } catch (NotFoundException e) {
-                key_max_count = KEY_MAX_COUNT;
             }
             try {
                 pos = UtilTLV.findTag(bArray, bOff, La, TAG_PIN_MAX_TRIES);
@@ -380,17 +427,132 @@ public class IsoApplet extends Applet implements ExtendedLength {
                 sopin_length = DEF_SOPIN_LENGTH;
             }
             try {
-                pos = UtilTLV.findTag(bArray, bOff, La, TAG_TRANSPORT_KEY);
+                pos = UtilTLV.findTag(bArray, bOff, La, TAG_KEY_MAX_COUNT);
                 len = UtilTLV.decodeLengthField(bArray, ++pos);
-                if(len != sopin_length) {
+                if(len != 1) {
                     throw InvalidArgumentsException.getInstance();
                 }
-                transport_key = new byte[len];
-                Util.arrayCopyNonAtomic(bArray, ++pos, transport_key, (short) 0, len);
-                have_transport_key = true;
+                key_max_count = bArray[++pos];
             } catch (NotFoundException e) {
-                transport_key = null;
-                have_transport_key = false;
+                key_max_count = KEY_MAX_COUNT;
+            }
+            if (bInit || IMPORT_EXPORT) {
+                try {
+                    pos = UtilTLV.findTag(bArray, bOff, La, TAG_HISTBYTES);
+                    len = UtilTLV.decodeLengthField(bArray, ++pos);
+                    if(len > MAX_HISTBYTES_LEN) {
+                       throw InvalidArgumentsException.getInstance();
+                    }
+                    histBytes = new byte[len];
+                    Util.arrayCopyNonAtomic(bArray, ++pos, histBytes, (short) 0, len);
+                    if (bInit) {
+                        histBytesSet = false;
+                    } else {
+                        if (GPSystem.setATRHistBytes(bArray, pos, (byte) histBytes.length)) {
+                            histBytesSet = true;
+                        }
+                    }
+                } catch (NotFoundException e) {
+                    histBytes = null;
+                }
+                try {
+                    pos = UtilTLV.findTag(bArray, bOff, La, TAG_SERIAL);
+                    len = UtilTLV.decodeLengthField(bArray, ++pos);
+                    if(len > MAX_SERIAL_LEN) {
+                       throw InvalidArgumentsException.getInstance();
+                    }
+                    serial = new byte[len];
+                    Util.arrayCopyNonAtomic(bArray, ++pos, serial, (short) 0, len);
+                } catch (NotFoundException e) {
+                    serial = new byte[4];
+                    RandomData.getInstance(RandomData.ALG_SECURE_RANDOM).generateData(serial, (short)0, (short)4);
+                }
+                try {
+                    pos = UtilTLV.findTag(bArray, bOff, La, TAG_TRANSPORT_KEY);
+                    len = UtilTLV.decodeLengthField(bArray, ++pos);
+                    if (len != 0) {
+                        if(len != sopin_length) {
+                            throw InvalidArgumentsException.getInstance();
+                        }
+                        transport_key = new byte[len];
+                        Util.arrayCopyNonAtomic(bArray, ++pos, transport_key, (short) 0, len);
+                        have_transport_key = true;
+                    }
+                } catch (NotFoundException e) {
+                    transport_key = null;
+                    have_transport_key = false;
+                }
+                if (ENABLE_IMPORT_EXPORT) {
+                    try {
+                        pos = UtilTLV.findTag(bArray, bOff, La, TAG_STATE);
+                        len = UtilTLV.decodeLengthField(bArray, ++pos);
+                        if(len != 1) {
+                           throw InvalidArgumentsException.getInstance();
+                        }
+                        state = bArray[++pos];
+                    } catch (NotFoundException e) {
+                        state = STATE_CREATION;
+                    }
+                    try {
+                        pos = UtilTLV.findTag(bArray, bOff, La, TAG_PIN);
+                        len = UtilTLV.decodeLengthField(bArray, ++pos);
+                        if(len > pin_max_length) {
+                           throw InvalidArgumentsException.getInstance();
+                        }
+                        Util.arrayFillNonAtomic(ram_buf, (short)0, pin_max_length, (byte) 0x00);
+                        Util.arrayCopy(bArray, ++pos, ram_buf, (short)0, len);
+                        pin = new OwnerPINexp(pin_max_tries, pin_max_length);
+                        pin.update(ram_buf, (short)0, pin_max_length);
+                        pin.resetAndUnblock();
+                    } catch (NotFoundException e) {
+                        pin = null;
+                    }
+                    try {
+                        pos = UtilTLV.findTag(bArray, bOff, La, TAG_SOPIN);
+                        len = UtilTLV.decodeLengthField(bArray, ++pos);
+                        if(len > sopin_length) {
+                           throw InvalidArgumentsException.getInstance();
+                        }
+                        Util.arrayFillNonAtomic(ram_buf, (short)0, sopin_length, (byte) 0x00);
+                        Util.arrayCopy(bArray, ++pos, ram_buf, (short)0, len);
+                        if (sopin != null) {
+                            // If transport key is used, then SO PIN has already been defined.
+                            sopin = null;
+                        }
+                        sopin = new OwnerPINexp(SOPIN_MAX_TRIES, sopin_length);
+                        sopin.update(ram_buf, (short)0, sopin_length);
+                        sopin.resetAndUnblock();
+                    } catch (NotFoundException e) {
+                        sopin = null;
+                    }
+                    try {
+                        pos = UtilTLV.findTag(bArray, bOff, La, TAG_PUK);
+                        len = UtilTLV.decodeLengthField(bArray, ++pos);
+                        if(len > puk_length + 1) {
+                           throw InvalidArgumentsException.getInstance();
+                        }
+                        Util.arrayFillNonAtomic(ram_buf, (short)0, (short)(puk_length + 1), (byte) 0x00);
+                        Util.arrayCopy(bArray, ++pos, ram_buf, (short)0, len);
+                        puk = new OwnerPINexp(PUK_MAX_TRIES, puk_length);
+                        puk.update(ram_buf, (short)1, puk_length);
+                        puk.resetAndUnblock();
+                        puk_is_set = ram_buf[0] != 0 ? true : false;
+                    } catch (NotFoundException e) {
+                        puk = null;
+                        puk_is_set = false;
+                    }
+                    // TAG_API_FEATURES is not restored
+                    try {
+                        pos = UtilTLV.findTag(bArray, bOff, La, TAG_INITCOUNT);
+                        len = UtilTLV.decodeLengthField(bArray, ++pos);
+                        if(len != 2) {
+                            throw InvalidArgumentsException.getInstance();
+                        }
+                        initCounter = Util.getShort(bArray, ++pos);
+                    } catch (NotFoundException e) {
+                        initCounter = 0;
+                    }
+                }
             }
         } catch (InvalidArgumentsException e) {
             ISOException.throwIt(ISO7816.SW_DATA_INVALID);
@@ -416,9 +578,15 @@ public class IsoApplet extends Applet implements ExtendedLength {
      */
     protected IsoApplet(byte[] bArray, short bOffset, byte bLength) {
         setDefaultValues(true, bArray, bOffset, bLength);
-        pin = new OwnerPIN(pin_max_tries, pin_max_length);
-        puk = new OwnerPIN(PUK_MAX_TRIES, puk_length);
-        sopin = new OwnerPIN(SOPIN_MAX_TRIES, sopin_length);
+        if (pin == null) {
+            pin = new OwnerPINexp(pin_max_tries, pin_max_length);
+        }
+        if (puk == null) {
+            puk = new OwnerPINexp(PUK_MAX_TRIES, puk_length);
+        }
+        if (sopin == null) {
+            sopin = new OwnerPINexp(SOPIN_MAX_TRIES, sopin_length);
+        }
         fs = new IsoFileSystem();
         try {
             Key prKey = KeyBuilder.buildKey(KeyBuilder.TYPE_RSA_CRT_PRIVATE, KeyBuilder.LENGTH_RSA_4096, false);
@@ -433,8 +601,15 @@ public class IsoApplet extends Applet implements ExtendedLength {
         if (have_transport_key) {
             sopin.update(transport_key, (short) 0, sopin_length);
             sopin.resetAndUnblock();
-            Util.arrayFillNonAtomic(transport_key, (short) 0, sopin_length, (byte) 0x00);
-            transport_key = null;
+            if (ENABLE_IMPORT_EXPORT) {
+                if (!IMPORT_EXPORT) {
+                    Util.arrayFillNonAtomic(transport_key, (short) 0, sopin_length, (byte) 0x00);
+                    transport_key = null;
+                }
+            } else {
+                Util.arrayFillNonAtomic(transport_key, (short) 0, sopin_length, (byte) 0x00);
+                transport_key = null;
+            }
         }
 
         currentAlgorithmRef = JCSystem.makeTransientByteArray((short)1, JCSystem.CLEAR_ON_DESELECT);
@@ -507,6 +682,13 @@ public class IsoApplet extends Applet implements ExtendedLength {
             api_features |= API_FEATURE_EXT_APDU;
         }
 
+        if (ENABLE_IMPORT_EXPORT) {
+            api_features |= API_FEATURE_ENABLE_IMPORT_EXPORT;
+            if (IMPORT_EXPORT) {
+                api_features |= API_FEATURE_IMPORT_EXPORT;
+            }
+        }
+
         register();
     }
 
@@ -524,6 +706,15 @@ public class IsoApplet extends Applet implements ExtendedLength {
      * \brief This method is called whenever the applet is being selected.
      */
     public boolean select() {
+        // Disable IMPORT_EXPORT in CARD_SECURED cards
+        if (ENABLE_IMPORT_EXPORT) {
+            if (IMPORT_EXPORT && GPSystem.getCardState() == GPSystem.CARD_SECURED) {
+                pin.clear();
+                sopin.clear();
+                puk.clear();
+                IMPORT_EXPORT = false;
+            }
+        }
         if(state == STATE_CREATION
                 || state == STATE_INITIALISATION) {
             fs.setUserAuthenticated(SOPIN_REF);
@@ -587,12 +778,14 @@ public class IsoApplet extends Applet implements ExtendedLength {
              * Command chaining only for:
              * 	- PERFORM SECURITY OPERATION
              * 	- GENERATE ASYMMETRIC KEYKAIR
+             * 	- GET DATA
              * 	- PUT DATA
              * when not using extended APDUs.
              */
             if( DEF_EXT_APDU ||
                     (ins != INS_PERFORM_SECURITY_OPERATION
                      && ins != INS_GENERATE_ASYMMETRIC_KEYPAIR
+                     && ins != INS_GET_DATA
                      && ins != INS_PUT_DATA)) {
                 ISOException.throwIt(ISO7816.SW_COMMAND_CHAINING_NOT_SUPPORTED);
             }
@@ -1404,6 +1597,25 @@ public class IsoApplet extends Applet implements ExtendedLength {
                 ram_chaining_cache[RAM_CHAINING_CACHE_OFFSET_BYTES_REMAINING] = bytesLeft;
                 ram_chaining_cache[RAM_CHAINING_CACHE_OFFSET_CURRENT_POS] = (short)(pos + sendLen);
                 short getRespLen = bytesLeft > 256 ? 256 : bytesLeft;
+                if (ENABLE_IMPORT_EXPORT) {
+                    if (IMPORT_EXPORT) {
+                        if (bytesLeft <= 256) {
+                            if (ram_chaining_cache[RAM_CHAINING_CACHE_TAGS_SENT] != TAG_NONE) {
+                                /* Remove data already sent */
+                                Util.arrayCopy(ram_buf, ram_chaining_cache[RAM_CHAINING_CACHE_OFFSET_CURRENT_POS], ram_buf, (short)0, bytesLeft);
+                                ram_chaining_cache[RAM_CHAINING_CACHE_OFFSET_CURRENT_POS] = 0;
+                                try {
+                                    /* Add as much new data as possible into ram_chaining_cache */
+                                    bytesLeft = exportRSAPrivateKey(bytesLeft);
+                                } catch (Exception e) {
+                                    ISOException.throwIt(ISO7816.SW_UNKNOWN);
+                                }
+                                ram_chaining_cache[RAM_CHAINING_CACHE_OFFSET_BYTES_REMAINING] = bytesLeft;
+                                getRespLen = bytesLeft > 256 ? 256 : bytesLeft;
+                            }
+                        }
+                    }
+                }
                 ISOException.throwIt( (short)(ISO7816.SW_BYTES_REMAINING_00 | getRespLen) );
                 // The next part of the data is now in ram_buf, metadata is in ram_chaining_cache.
                 // It can be fetched by the host via GET RESPONSE.
@@ -1996,14 +2208,40 @@ public class IsoApplet extends Applet implements ExtendedLength {
     /**
      * \brief Process the GET DATA apdu (INS = CA).
      *
-     * GET DATA is currently used for obtaining directory listing.
+     * GET DATA is currently used for obtaining directory listing and IMPORT_EXPORT.
      *
-     * \throw ISOException SW_INCORRECT_P1P2, SW_FILE_INVALID
+     * \throw ISOException SW_INCORRECT_P1P2, SW_FILE_INVALID, SW_UNKNOWN
      */
     private void processGetData(APDU apdu) throws ISOException {
         byte[] buf = apdu.getBuffer();
         byte p1 = buf[ISO7816.OFFSET_P1];
         byte p2 = buf[ISO7816.OFFSET_P2];
+
+        if(ENABLE_IMPORT_EXPORT) {
+            // export non-sensitive part of config
+            try {
+                if (p1 == (byte) 0x3F && p2 == (byte) 0xCF) {
+                    exportConfig(apdu);
+                    return;
+                }
+            } catch (InvalidArgumentsException e) {
+                ISOException.throwIt(ISO7816.SW_UNKNOWN);
+            } catch (NotEnoughSpaceException e) {
+                ISOException.throwIt(ISO7816.SW_UNKNOWN);
+            }
+            if(IMPORT_EXPORT) {
+                try {
+                    if (p1 == (byte) 0x3F && p2 == (byte) 0xFF) {
+                        exportPrivateKey(apdu);
+                        return;
+                    }
+                } catch (InvalidArgumentsException e) {
+                    ISOException.throwIt(ISO7816.SW_UNKNOWN);
+                } catch (NotEnoughSpaceException e) {
+                    ISOException.throwIt(ISO7816.SW_UNKNOWN);
+                }
+            }
+        }
 
         // Return directory entries
         if(p1 == 0x01 && p2 == 0) {
@@ -2011,6 +2249,446 @@ public class IsoApplet extends Applet implements ExtendedLength {
             return;
         }
         ISOException.throwIt(ISO7816.SW_INCORRECT_P1P2);
+    }
+
+    /**
+     * \brief Export global card config data.
+     *
+     * \throw ISOException SW_SECURITY_STATUS_NOT_SATISFIED
+    */
+    private void exportConfig(APDU apdu) throws InvalidArgumentsException, NotEnoughSpaceException {
+        short pos, len;
+
+        // Reset export private key data
+        ram_chaining_cache[RAM_CHAINING_CACHE_TAGS_SENT] = TAG_NONE;
+
+        if(ENABLE_IMPORT_EXPORT) {
+            if(IMPORT_EXPORT) {
+                if (state != STATE_CREATION && state != STATE_INITIALISATION) {
+                    if (pin.check()) {
+                        fs.setUserAuthenticated(PIN_REF);
+                    }
+                }
+                if( have_transport_key && state != STATE_CREATION ) {
+                    if (sopin.check()) {
+                        fs.setUserAuthenticated(SOPIN_REF);
+                    }
+                }
+            }
+        }
+
+        pos = 3;
+
+        pos += UtilTLV.writeTagAndLen(TAG_PIN_MAX_TRIES, (short)1, ram_buf, pos);
+        ram_buf[pos++] = pin_max_tries;
+
+        pos += UtilTLV.writeTagAndLen(TAG_PUK_MUST_BE_SET, (short)1, ram_buf, pos);
+        ram_buf[pos++] = puk_must_be_set ? (byte)1 : (byte)0;
+
+        pos += UtilTLV.writeTagAndLen(TAG_ENABLE_KEY_IMPORT, (short)1, ram_buf, pos);
+        ram_buf[pos++] = private_key_import_allowed ? (byte)1 : (byte)0;
+
+        pos += UtilTLV.writeTagAndLen(TAG_PIN_MAX_LENGTH, (short)1, ram_buf, pos);
+        ram_buf[pos++] = pin_max_length;
+
+        pos += UtilTLV.writeTagAndLen(TAG_PUK_LENGTH, (short)1, ram_buf, pos);
+        ram_buf[pos++] = puk_length;
+
+        pos += UtilTLV.writeTagAndLen(TAG_SOPIN_LENGTH, (short)1, ram_buf, pos);
+        ram_buf[pos++] = sopin_length;
+
+        pos += UtilTLV.writeTagAndLen(TAG_KEY_MAX_COUNT, (short)1, ram_buf, pos);
+        ram_buf[pos++] = (byte)key_max_count;
+
+        if (histBytes != null) {
+            len = (short)histBytes.length;
+            pos += UtilTLV.writeTagAndLen(TAG_HISTBYTES, len, ram_buf, pos);
+            Util.arrayCopy(histBytes, (short) 0, ram_buf, pos, len);
+            pos += len;
+        }
+
+        if (have_transport_key) {
+            boolean done = false;
+            if(ENABLE_IMPORT_EXPORT) {
+                if(IMPORT_EXPORT) {
+                    len = (short)transport_key.length;
+                    pos += UtilTLV.writeTagAndLen(TAG_TRANSPORT_KEY, len, ram_buf, pos);
+                    Util.arrayCopy(transport_key, (short) 0, ram_buf, pos, len);
+                    pos += len;
+                    done = true;
+                }
+            }
+            if (!done) {
+                pos += UtilTLV.writeTagAndLen(TAG_TRANSPORT_KEY, (short)0, ram_buf, pos);
+            }
+        }
+
+        len = (short)serial.length;
+        pos += UtilTLV.writeTagAndLen(TAG_SERIAL, len, ram_buf, pos);
+        Util.arrayCopy(serial, (short) 0, ram_buf, pos, len);
+        pos += len;
+
+        pos += UtilTLV.writeTagAndLen(TAG_IMPORT_EXPORT, (short)1, ram_buf, pos);
+        ram_buf[pos++] = IMPORT_EXPORT ? (byte)1 : (byte)0;
+
+        pos += UtilTLV.writeTagAndLen(TAG_API_FEATURES, (short)2, ram_buf, pos);
+        Util.setShort(ram_buf, pos, api_features);
+        pos += 2;
+
+        pos += UtilTLV.writeTagAndLen(TAG_INITCOUNT, (short)2, ram_buf, pos);
+        Util.setShort(ram_buf, pos, initCounter);
+        pos += 2;
+
+        if(ENABLE_IMPORT_EXPORT) {
+            if(IMPORT_EXPORT) {
+                pos += UtilTLV.writeTagAndLen(TAG_STATE, (short)1, ram_buf, pos);
+                ram_buf[pos++] = state;
+
+                if (state != STATE_CREATION && state != STATE_INITIALISATION) {
+                    len = pin.copyPIN(ram_buf, pos);
+                    pos += UtilTLV.writeTagAndLen(TAG_PIN, len, ram_buf, pos);
+                    pos += pin.copyPIN(ram_buf, pos);
+                }
+
+                if (state != STATE_CREATION) {
+                    len = puk.copyPIN(ram_buf, pos);
+                    pos += UtilTLV.writeTagAndLen(TAG_PUK, (short)(len + 1), ram_buf, pos);
+                    ram_buf[pos++] = puk_is_set ? (byte)1 : (byte)0;
+                    pos += puk.copyPIN(ram_buf, pos);
+                }
+
+                if (state != STATE_CREATION) {
+                    len = sopin.copyPIN(ram_buf, pos);
+                    pos += UtilTLV.writeTagAndLen(TAG_SOPIN, len, ram_buf, pos);
+                    pos += sopin.copyPIN(ram_buf, pos);
+                }
+            }
+        }
+
+        /* Write outer tag and adjust for tag length */
+        len = UtilTLV.writeTagAndLen(TAG_CONFIG, (short)(pos - 3), ram_buf, (short)0);
+        if (len != 3) {
+            Util.arrayCopy(ram_buf, (short)3, ram_buf, len, (short)(pos - 3));
+            pos -= (3 - len);
+        }
+
+        apdu.setOutgoing();
+        sendLargeData(apdu, (short)0, pos);
+    }
+
+    /**
+     * \brief Export parts of private key that fit into ram_buf
+     *
+     * \param pos Position in ram_buf at which to put additional data
+     *
+     * \throw InvalidArgumentsException, NotEnoughSpaceException, ISOException SW_UNKNOWN
+     */
+    private short exportRSAPrivateKey(short pos) throws InvalidArgumentsException, NotEnoughSpaceException, ISOException {
+
+        short tags_to_send = 0, tot_len, len, tag_len;
+        short privKeyRef = currentPrivateKeyRef[0];
+
+        if (privKeyRef < 0 || privKeyRef >= key_max_count)
+            ISOException.throwIt(ISO7816.SW_UNKNOWN);
+
+        RSAPrivateCrtKey rsaKey = (RSAPrivateCrtKey) keys[privKeyRef];
+
+        tot_len = pos;
+
+        /* Get P size */
+        if ((ram_chaining_cache[RAM_CHAINING_CACHE_TAGS_SENT] & RSA_TAG_92) == 0) {
+            len = rsaKey.getP(ram_buf, pos);
+            tag_len = UtilTLV.writeTagAndLen((short)0x92, len, ram_buf, pos);
+            if ((short)(tot_len + tag_len + len) <= RAM_BUF_SIZE) {
+                tot_len += tag_len;
+                tot_len += len;
+                tags_to_send |= RSA_TAG_92;
+            }
+        }
+
+        /* Get Q size */
+        if ((ram_chaining_cache[RAM_CHAINING_CACHE_TAGS_SENT] & RSA_TAG_93) == 0) {
+            len = rsaKey.getQ(ram_buf, pos);
+            tag_len = UtilTLV.writeTagAndLen((short)0x93, len, ram_buf, pos);
+            if ((short)(tot_len + tag_len + len) <= RAM_BUF_SIZE) {
+                tot_len += tag_len;
+                tot_len += len;
+                tags_to_send |= RSA_TAG_93;
+            }
+        }
+
+        /* Get PQ (1/q mod p) */
+        if ((ram_chaining_cache[RAM_CHAINING_CACHE_TAGS_SENT] & RSA_TAG_94) == 0) {
+            len = rsaKey.getPQ(ram_buf, pos);
+            tag_len = UtilTLV.writeTagAndLen((short)0x94, len, ram_buf, pos);
+            if ((short)(tot_len + tag_len + len) <= RAM_BUF_SIZE) {
+                tot_len += tag_len;
+                tot_len += len;
+                tags_to_send |= RSA_TAG_94;
+            }
+        }
+
+        /* Get DP1 (d mod (p-1)) */
+        if ((ram_chaining_cache[RAM_CHAINING_CACHE_TAGS_SENT] & RSA_TAG_95) == 0) {
+            len = rsaKey.getDP1(ram_buf, pos);
+            tag_len = UtilTLV.writeTagAndLen((short)0x95, len, ram_buf, pos);
+            if ((short)(tot_len + tag_len + len) <= RAM_BUF_SIZE) {
+                tot_len += tag_len;
+                tot_len += len;
+                tags_to_send |= RSA_TAG_95;
+            }
+        }
+
+        /* Get DQ1 (d mod (q-1)) */
+        if ((ram_chaining_cache[RAM_CHAINING_CACHE_TAGS_SENT] & RSA_TAG_96) == 0) {
+            len = rsaKey.getDQ1(ram_buf, pos);
+            tag_len = UtilTLV.writeTagAndLen((short)0x96, len, ram_buf, pos);
+            if ((short)(tot_len + tag_len + len) < RAM_BUF_SIZE) {
+                tot_len += tag_len;
+                tot_len += len;
+                tags_to_send |= RSA_TAG_96;
+            }
+        }
+
+        /*
+         *
+         * Now write tags
+         *
+         */
+
+        /* Write P */
+        if ((tags_to_send & RSA_TAG_92) != 0) {
+            len = rsaKey.getP(ram_buf, pos);
+            pos += UtilTLV.writeTagAndLen((short)0x92, len, ram_buf, pos);
+            pos += rsaKey.getP(ram_buf, pos);
+            ram_chaining_cache[RAM_CHAINING_CACHE_TAGS_SENT] |= RSA_TAG_92;
+        }
+
+        /* Write Q */
+        if ((tags_to_send & RSA_TAG_93) != 0) {
+            len = rsaKey.getQ(ram_buf, pos);
+            pos += UtilTLV.writeTagAndLen((short)0x93, len, ram_buf, pos);
+            pos += rsaKey.getQ(ram_buf, pos);
+            ram_chaining_cache[RAM_CHAINING_CACHE_TAGS_SENT] |= RSA_TAG_93;
+        }
+
+        /* Write PQ (1/q mod p) */
+        if ((tags_to_send & RSA_TAG_94) != 0) {
+            len = rsaKey.getPQ(ram_buf, pos);
+            pos += UtilTLV.writeTagAndLen((short)0x94, len, ram_buf, pos);
+            pos += rsaKey.getPQ(ram_buf, pos);
+            ram_chaining_cache[RAM_CHAINING_CACHE_TAGS_SENT] |= RSA_TAG_94;
+        }
+
+        /* Write DP1 (d mod (p-1)) */
+        if ((tags_to_send & RSA_TAG_95) != 0) {
+            len = rsaKey.getDP1(ram_buf, pos);
+            pos += UtilTLV.writeTagAndLen((short)0x95, len, ram_buf, pos);
+            pos += rsaKey.getDP1(ram_buf, pos);
+            ram_chaining_cache[RAM_CHAINING_CACHE_TAGS_SENT] |= RSA_TAG_95;
+        }
+
+        /* Write DQ1 (d mod (q-1)) */
+        if ((tags_to_send & RSA_TAG_96) != 0) {
+            len = rsaKey.getDQ1(ram_buf, pos);
+            pos += UtilTLV.writeTagAndLen((short)0x96, len, ram_buf, pos);
+            pos += rsaKey.getDQ1(ram_buf, pos);
+            ram_chaining_cache[RAM_CHAINING_CACHE_TAGS_SENT] |= RSA_TAG_96;
+        }
+
+        /* All done? */
+        if (ram_chaining_cache[RAM_CHAINING_CACHE_TAGS_SENT] == TAG_ALL) {
+            ram_chaining_cache[RAM_CHAINING_CACHE_TAGS_SENT] = TAG_NONE;
+            currentPrivateKeyRef[0] = -1;
+        }
+
+        return pos;
+    }
+
+    /**
+     * \brief Export private key.
+     *
+     * \throw ISOException SW_SECURITY_STATUS_NOT_SATISFIED, SW_DATA_INVALID, SW_CONDITIONS_NOT_SATISFIED.
+     */
+    private void exportPrivateKey(APDU apdu) throws InvalidArgumentsException, NotEnoughSpaceException, ISOException {
+        byte[] buf = apdu.getBuffer();
+        short offset_cdata, lc;
+        short pos, len;
+        short tags_len = 0;
+        byte privKeyRef = -1, algRef = -1;
+
+        if(!IMPORT_EXPORT) {
+            ISOException.throwIt(ISO7816.SW_COMMAND_NOT_ALLOWED);
+        }
+
+        if (state != STATE_CREATION && state != STATE_INITIALISATION) {
+            if( ! pin.isValidated() ) {
+                ISOException.throwIt(ISO7816.SW_SECURITY_STATUS_NOT_SATISFIED);
+            }
+        }
+
+        lc = apdu.setIncomingAndReceive();
+        if(lc != apdu.getIncomingLength() || lc != 1) {
+            ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
+        }
+        offset_cdata = apdu.getOffsetCdata();
+
+        privKeyRef = buf[offset_cdata];
+        if (privKeyRef < 0 || privKeyRef >= key_max_count) {
+            ISOException.throwIt(ISO7816.SW_DATA_INVALID);
+        }
+        if (keys[privKeyRef] == null) {
+            ISOException.throwIt(ISO7816.SW_NO_ERROR);
+        }
+
+        switch (keys[privKeyRef].getType()) {
+            case KeyBuilder.TYPE_RSA_CRT_PRIVATE:
+                algRef = ALG_GEN_RSA;
+                break;
+            case KeyBuilder.TYPE_EC_FP_PRIVATE:
+                algRef = ALG_GEN_EC;
+                break;
+            default:
+                ISOException.throwIt(ISO7816.SW_CONDITIONS_NOT_SATISFIED);
+        }
+
+        switch(algRef) {
+        case ALG_GEN_RSA:
+            // RSA key export.
+
+            /* Store it for later */
+            currentPrivateKeyRef[0] = privKeyRef;
+
+            RSAPrivateCrtKey rsaKey = (RSAPrivateCrtKey) keys[privKeyRef];
+
+            /*
+             *
+             * Get outer tag length
+             *
+             */
+
+            /* Key position */
+            len = 1;
+            tags_len += UtilTLV.writeTagAndLen((short)0x1D, len, ram_buf, (short)0);
+            tags_len += len;
+
+            /* Key length */
+            len = 2;
+            tags_len += UtilTLV.writeTagAndLen((short)0x91, len, ram_buf, (short)0);
+            tags_len += len;
+
+            /* P */
+            len = rsaKey.getP(ram_buf, (short)0);
+            tags_len += UtilTLV.writeTagAndLen((short)0x92, len, ram_buf, (short)0);
+            tags_len += len;
+
+            /* Q */
+            len = rsaKey.getQ(ram_buf, (short)0);
+            tags_len += UtilTLV.writeTagAndLen((short)0x93, len, ram_buf, (short)0);
+            tags_len += len;
+
+            /* PQ */
+            len = rsaKey.getPQ(ram_buf, (short)0);
+            tags_len += UtilTLV.writeTagAndLen((short)0x94, len, ram_buf, (short)0);
+            tags_len += len;
+
+            /* DP1 */
+            len = rsaKey.getDP1(ram_buf, (short)0);
+            tags_len += UtilTLV.writeTagAndLen((short)0x95, len, ram_buf, (short)0);
+            tags_len += len;
+
+            /* DQ1 */
+            len = rsaKey.getDQ1(ram_buf, (short)0);
+            tags_len += UtilTLV.writeTagAndLen((short)0x96, len, ram_buf, (short)0);
+            tags_len += len;
+
+            /* Write outer tag */
+            pos = UtilTLV.writeTagAndLen((short)0x7F48, tags_len, ram_buf, (short)0);
+
+            /* Write Key position */
+            len = 1;
+            pos += UtilTLV.writeTagAndLen((short)0x1D, len, ram_buf, pos);
+            ram_buf[pos] = privKeyRef;
+            pos += len;
+
+            /* Write Key length */
+            len = 2;
+            pos += UtilTLV.writeTagAndLen((short)0x91, len, ram_buf, pos);
+            Util.setShort(ram_buf, pos, rsaKey.getSize());
+            pos += len;
+
+            /* Add as much data as possible into ram_chaining_cache */
+            ram_chaining_cache[RAM_CHAINING_CACHE_TAGS_SENT] = TAG_NONE;
+            pos = exportRSAPrivateKey(pos);
+
+            // ram_buf now contains complete private key, or whatever could fit in
+            apdu.setOutgoing();
+            sendLargeData(apdu, (short)0, pos);
+
+            break;
+        case ALG_GEN_EC:
+            // EC key export.
+
+            ECPrivateKey ecKey = (ECPrivateKey) keys[privKeyRef];
+
+            // Make space for outer tag, len can be encoded as 1 or 2 bytes
+            pos = 4;
+
+            /* Write key position */
+            pos += UtilTLV.writeTagAndLen((short)0x1D, (short)1, ram_buf, pos);
+            ram_buf[pos++] = privKeyRef;
+
+            /* Prime - "P" */
+            len = ecKey.getField(ram_buf, pos);
+            pos += UtilTLV.writeTagAndLen((short)0x81, len, ram_buf, pos);
+            pos += ecKey.getField(ram_buf, pos);
+
+            /* First coefficient - "A" */
+            len = ecKey.getA(ram_buf, pos);
+            pos += UtilTLV.writeTagAndLen((short)0x82, len, ram_buf, pos);
+            pos += ecKey.getA(ram_buf, pos);
+
+            /*/ Second coefficient - "B" */
+            len = ecKey.getB(ram_buf, pos);
+            pos += UtilTLV.writeTagAndLen((short)0x83, len, ram_buf, pos);
+            pos += ecKey.getB(ram_buf, pos);
+
+            /* Generator - "PB" */
+            len = ecKey.getG(ram_buf, pos);
+            pos += UtilTLV.writeTagAndLen((short)0x84, len, ram_buf, pos);
+            pos += ecKey.getG(ram_buf, pos);
+
+            /* Order - "Q" */
+            len = ecKey.getR(ram_buf, pos);
+            pos += UtilTLV.writeTagAndLen((short)0x85, len, ram_buf, pos);
+            pos += ecKey.getR(ram_buf, pos);
+
+            /* Cofactor */
+            len = 2;
+            pos += UtilTLV.writeTagAndLen((short)0x87, len, ram_buf, pos);
+            Util.setShort(ram_buf, pos, ecKey.getK());
+            pos += 2;
+
+            /* Private key - "S" */
+            len = ecKey.getS(ram_buf, pos);
+            pos += UtilTLV.writeTagAndLen((short)0x88, len, ram_buf, pos);
+            pos += ecKey.getS(ram_buf, pos);
+
+            /* Write outer tag and adjust for tag length */
+            len = UtilTLV.writeTagAndLen((short)0xE0, (short)(pos - 4), ram_buf, (short)0);
+            if (len != 4) {
+                Util.arrayCopy(ram_buf, (short)4, ram_buf, len, (short)(pos - 4));
+                pos -= (4 - len);
+            }
+
+            // ram_buf now contains the complete private key.
+            apdu.setOutgoing();
+            sendLargeData(apdu, (short)0, pos);
+
+            break;
+        default:
+            ISOException.throwIt(ISO7816.SW_CONDITIONS_NOT_SATISFIED);
+        }
     }
 
     /**
@@ -2030,7 +2708,13 @@ public class IsoApplet extends Applet implements ExtendedLength {
         }
 
         if(p1 == (byte) 0x3F && p2 == (byte) 0xFF) {
-            if( ! private_key_import_allowed) {
+            boolean import_allowed = private_key_import_allowed;
+            if(ENABLE_IMPORT_EXPORT) {
+                if(IMPORT_EXPORT) {
+                    import_allowed = true;
+                }
+            }
+            if( ! import_allowed) {
                 ISOException.throwIt(SW_COMMAND_NOT_ALLOWED_GENERAL);
             }
             try {
@@ -2610,20 +3294,37 @@ public class IsoApplet extends Applet implements ExtendedLength {
         byte[] buf = apdu.getBuffer();
         byte p1 = buf[ISO7816.OFFSET_P1];
         byte p2 = buf[ISO7816.OFFSET_P2];
-        short lc;
+        short lc = apdu.setIncomingAndReceive();
+        short offset_cdata = apdu.getOffsetCdata();
 
         if(p1 != 0x00 || p2 != 0x00) {
             ISOException.throwIt(ISO7816.SW_INCORRECT_P1P2);
+        }
+
+        // Card restore can be done without SO PIN
+        if (ENABLE_IMPORT_EXPORT) {
+            if (IMPORT_EXPORT) {
+                if(have_transport_key) {
+                    sopin.check();
+                }
+            }
         }
 
         if( have_transport_key && state != STATE_CREATION && !sopin.isValidated() ) {
             ISOException.throwIt(ISO7816.SW_SECURITY_STATUS_NOT_SATISFIED);
         }
         // Erase PIN, PUK & SO PIN (only if transport key was not set)
-        pin = null;
-        puk = null;
+        if (pin != null) {
+            pin.clear();
+            pin = null;
+        }
+        if (puk != null) {
+            puk.clear();
+            puk = null;
+        }
         puk_is_set = false;
-        if (!have_transport_key) {
+        if (!have_transport_key && sopin != null) {
+            sopin.clear();
             sopin = null;
         }
         // Erase file system
@@ -2654,23 +3355,66 @@ public class IsoApplet extends Applet implements ExtendedLength {
         state = STATE_CREATION;
 
         // Check for new config
-        lc = apdu.setIncomingAndReceive();
-        if (lc > 0) {
-            if(lc != apdu.getIncomingLength()) {
-                ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
-            }
-            setDefaultValues(false, buf, apdu.getOffsetCdata(), (byte)lc);
+        try {
+            short pos = UtilTLV.findTag(buf, offset_cdata, lc, (byte)TAG_CONFIG);
+            short len = UtilTLV.decodeLengthField(buf, ++pos);
+            pos += UtilTLV.getLengthFieldLength(len);
+            setDefaultValues(false, buf, pos, len);
+            offset_cdata = pos;
+            lc = len;
+        } catch (Exception e) {
         }
 
         // Create new objects
-        pin = new OwnerPIN(pin_max_tries, pin_max_length);
-        puk = new OwnerPIN(PUK_MAX_TRIES, puk_length);
-        // If transport key was configured, then a valid SO PIN has to be presented during initialisation
-        if (!have_transport_key) {
-            sopin = new OwnerPIN(SOPIN_MAX_TRIES, sopin_length);
+        if (pin == null) {
+            pin = new OwnerPINexp(pin_max_tries, pin_max_length);
+        }
+        if (puk == null) {
+            puk = new OwnerPINexp(PUK_MAX_TRIES, puk_length);
+        }
+        if (sopin == null) {
+            sopin = new OwnerPINexp(SOPIN_MAX_TRIES, sopin_length);
+            if (have_transport_key) {
+                sopin.update(transport_key, (short) 0, sopin_length);
+                sopin.resetAndUnblock();
+                if (ENABLE_IMPORT_EXPORT) {
+                    if (!IMPORT_EXPORT) {
+                        Util.arrayFillNonAtomic(transport_key, (short) 0, sopin_length, (byte) 0x00);
+                        transport_key = null;
+                    }
+                } else {
+                    Util.arrayFillNonAtomic(transport_key, (short) 0, sopin_length, (byte) 0x00);
+                    transport_key = null;
+                }
+            }
         }
         fs = new IsoFileSystem();
         keys = new Key[key_max_count];
+
+        api_features &= ~API_FEATURE_IMPORT_EXPORT;
+        if (ENABLE_IMPORT_EXPORT) {
+            if (IMPORT_EXPORT) {
+                api_features |= API_FEATURE_IMPORT_EXPORT;
+                // In case PIN was provided mark fs authenticated
+                try {
+                    UtilTLV.findTag(buf, offset_cdata, lc, TAG_PIN);
+                    if(pin.check()) {
+                        fs.setUserAuthenticated(PIN_REF);
+                    }
+                } catch (Exception e) {
+                }
+                try {
+                    UtilTLV.findTag(buf, offset_cdata, lc, TAG_SOPIN);
+                    if(sopin.check()) {
+                        fs.setUserAuthenticated(SOPIN_REF);
+                    }
+                } catch (Exception e) {
+                }
+                if(state == STATE_CREATION || state == STATE_INITIALISATION) {
+                    fs.setUserAuthenticated(SOPIN_REF);
+                }
+            }
+        }
 
         // All done
         apdu.setOutgoingAndSend((short) 0, (short) 0);
