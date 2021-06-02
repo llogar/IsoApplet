@@ -41,6 +41,8 @@ public class IsoFileSystem extends DedicatedFile {
     public static final short SW_COMMAND_INCOMPATIBLE_WITH_FILE_STRUCTURE = 0x6981;
     public static final short SW_OFFSET_OUTSIDE_EF = 0x6B00;
 
+    private static final byte MAX_PINS = 16;
+
     public static final byte OFFSET_CURRENT_DF = 0;
     public static final byte OFFSET_CURRENT_EF = 1;
 
@@ -65,7 +67,7 @@ public class IsoFileSystem extends DedicatedFile {
     public IsoFileSystem(short fileID, byte[] fileControlInformation) {
         super(fileID, fileControlInformation);
         this.currentRecordNum = 0;
-        this.isUserAuthenticated = JCSystem.makeTransientBooleanArray((short) 1, JCSystem.CLEAR_ON_DESELECT);
+        this.isUserAuthenticated = JCSystem.makeTransientBooleanArray(MAX_PINS, JCSystem.CLEAR_ON_DESELECT);
         this.currentlySelectedFiles = JCSystem.makeTransientObjectArray((short) 2, JCSystem.CLEAR_ON_DESELECT);
         this.currentlySelectedFiles[OFFSET_CURRENT_DF] = this;
     }
@@ -157,8 +159,14 @@ public class IsoFileSystem extends DedicatedFile {
      * even those that the IsoFileSystem saves references for, if it uses any other method to manipulate
      * files.
      */
-    public void setUserAuthenticated(boolean isAuthenticated) {
-        this.isUserAuthenticated[0] = isAuthenticated;
+    public void setUserAuthenticated(byte pin) {
+        if (pin >= 0 && pin < MAX_PINS)
+            this.isUserAuthenticated[pin] = true;
+    }
+    public void setUserAuthenticated(boolean b) {
+        if (!b)
+            for (byte pin = 0; pin < MAX_PINS; pin++)
+                this.isUserAuthenticated[pin] = false;
     }
 
     /**
@@ -187,11 +195,15 @@ public class IsoFileSystem extends DedicatedFile {
             return;
         } else if(acl == (byte) 0xFF) { // Never.
             ISOException.throwIt(ISO7816.SW_SECURITY_STATUS_NOT_SATISFIED);
-        } else if(acl == (byte) 0x90
-                  || (byte)(acl&(byte)0x9F) == (byte)0x10) {
-            // PIN required.
-            if(isUserAuthenticated[0]) {
-                return;
+        } else if ((acl & 0xF0) == 0x90) {
+            byte pin = (byte)((acl & 0x0F) + 1);
+            if(pin >= 0 && pin < MAX_PINS) {
+                // PIN required.
+                if(isUserAuthenticated[pin]) {
+                    return;
+                } else {
+                    ISOException.throwIt(ISO7816.SW_SECURITY_STATUS_NOT_SATISFIED);
+                }
             } else {
                 ISOException.throwIt(ISO7816.SW_SECURITY_STATUS_NOT_SATISFIED);
             }
