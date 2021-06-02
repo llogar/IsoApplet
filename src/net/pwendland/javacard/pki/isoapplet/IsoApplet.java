@@ -39,6 +39,7 @@ import javacardx.crypto.Cipher;
 import javacardx.apdu.ExtendedLength;
 import javacard.security.CryptoException;
 import javacard.security.Signature;
+import javacard.security.MessageDigest;
 import javacard.security.RandomData;
 import org.globalplatform.GPSystem;
 
@@ -128,6 +129,7 @@ public class IsoApplet extends Applet implements ExtendedLength {
 
     private static final byte ALG_GEN_EC = (byte) 0xEC;
     private static final byte ALG_ECDSA_SHA1 = (byte) 0x21;
+    private static final byte ALG_ECDSA_PRECOMPUTED_HASH = (byte) 0x22;
 
     private static final short KeyBuilder_LENGTH_RSA_3072 = 3072;
 
@@ -147,8 +149,9 @@ public class IsoApplet extends Applet implements ExtendedLength {
 
     private static final short API_FEATURE_EXT_APDU = (short) 0x0001;
     private static final short API_FEATURE_SECURE_RANDOM = (short) 0x0002;
-    private static final short API_FEATURE_ECC = (short) 0x0004;
+    private static final short API_FEATURE_ECC_SHA1 = (short) 0x0004;
     private static final short API_FEATURE_RSA_4096 = (short) 0x0008;
+    private static final short API_FEATURE_ECC_PRECOMP = (short) 0x0010;
 
     /* Other constants */
     // "ram_buf" is used for:
@@ -204,7 +207,9 @@ public class IsoApplet extends Applet implements ExtendedLength {
     private byte[] ram_buf = null;
     private short[] ram_chaining_cache = null;
     private Cipher rsaPkcs1Cipher = null;
-    private Signature ecdsaSignature = null;
+    private Signature ecdsaSignatureSha1 = null;
+    private Signature ecdsaSignaturePrecomp = null;
+    private boolean ecdsaSHA512;
     private RandomData randomData = null;
     private short api_features = 0;
     private byte pin_max_tries = PIN_MAX_TRIES;
@@ -434,18 +439,41 @@ public class IsoApplet extends Applet implements ExtendedLength {
         rsaPkcs1Cipher = Cipher.getInstance(Cipher.ALG_RSA_PKCS1, false);
 
         try {
-            ecdsaSignature = Signature.getInstance(Signature.ALG_ECDSA_SHA, false);
-            api_features |= API_FEATURE_ECC;
+            ecdsaSignatureSha1 = Signature.getInstance(Signature.ALG_ECDSA_SHA, false);
+            api_features |= API_FEATURE_ECC_SHA1;
         } catch (CryptoException e) {
             if(e.getReason() == CryptoException.NO_SUCH_ALGORITHM) {
                 /* Few Java Cards do not support ECDSA at all.
                  * We should not throw an exception in this cases
                  * as this would prevent installation. */
-                ecdsaSignature = null;
-                api_features &= ~API_FEATURE_ECC;
+                ecdsaSignatureSha1 = null;
+                api_features &= ~API_FEATURE_ECC_SHA1;
             } else {
                 throw e;
             }
+        }
+
+        /* Some 3.0.4 cards support Signature.SIG_CIPHER_ECDSA which can sign arbitrary long input data,
+         * cards that don't support this can still sign max 64 bytes of data using ALG_ECDSA_SHA_512 and
+         * Signature.signPreComputedHash() */
+        try {
+            ecdsaSignaturePrecomp = Signature.getInstance(MessageDigest.ALG_NULL, Signature.SIG_CIPHER_ECDSA, Cipher.PAD_NULL, false);
+            ecdsaSHA512 = false;
+        } catch (Exception e) {
+            ecdsaSignaturePrecomp = null;
+        }
+        if (ecdsaSignaturePrecomp == null) {
+            try {
+                ecdsaSignaturePrecomp = Signature.getInstance(Signature.ALG_ECDSA_SHA_512, false);
+                ecdsaSHA512 = true;
+            } catch (Exception e) {
+                ecdsaSignaturePrecomp = null;
+            }
+        }
+        if (ecdsaSignaturePrecomp != null) {
+            api_features |= API_FEATURE_ECC_PRECOMP;
+        } else {
+            api_features &= ~API_FEATURE_ECC_PRECOMP;
         }
 
         try {
@@ -1571,7 +1599,7 @@ public class IsoApplet extends Applet implements ExtendedLength {
             if(privKeyRef < 0) {
                 ISOException.throwIt(ISO7816.SW_DATA_INVALID);
             }
-            if(algRef == ALG_GEN_EC && ecdsaSignature == null) {
+            if(algRef == ALG_GEN_EC && ecdsaSignatureSha1 == null && ecdsaSignaturePrecomp == null) {
                 // There are cards that do not support ECDSA at all.
                 ISOException.throwIt(ISO7816.SW_FUNC_NOT_SUPPORTED);
             }
@@ -1594,12 +1622,12 @@ public class IsoApplet extends Applet implements ExtendedLength {
                     ISOException.throwIt(ISO7816.SW_DATA_INVALID);
                 }
 
-            } else if(algRef == ALG_ECDSA_SHA1) {
+            } else if(algRef == ALG_ECDSA_SHA1 || algRef == ALG_ECDSA_PRECOMPUTED_HASH) {
                 // Key reference must point to a EC private key.
                 if(keys[privKeyRef].getType() != KeyBuilder.TYPE_EC_FP_PRIVATE) {
                     ISOException.throwIt(ISO7816.SW_DATA_INVALID);
                 }
-                if(ecdsaSignature == null) {
+                if(ecdsaSignatureSha1 == null && ecdsaSignaturePrecomp == null) {
                     ISOException.throwIt(ISO7816.SW_FUNC_NOT_SUPPORTED);
                 }
 
@@ -1731,6 +1759,35 @@ public class IsoApplet extends Applet implements ExtendedLength {
     }
 
     /**
+     * \brief Fit the data in the buffer to the length of the selected key size.
+     * 			If data length is shorter then key length, data will be filled up with zeros in front of data
+     * 			If data length is bigger then key length, the input data will will be truncated to the key lengths leftmost bytes
+     *
+     * \param keySize Key size in bits
+     *
+     * \param in Contains the data
+     *
+     * \param inOffset Offset in the buffer where the data begins
+     *
+     * \param inLen Length of the data in the buffer
+     *
+     * \param dataBuff Output buffer
+     *
+     * \return Number of bytes of signature output in dataBuff
+     */
+    private short fitDataToKeyLength(short keySize, byte[] in, short inOffset, short inLen, byte[] dataBuff) {
+        keySize += 7;
+        keySize /= 8;
+        if (inLen < keySize) {
+            Util.arrayCopyNonAtomic(in, inOffset, dataBuff, (short) (keySize - inLen), inLen);
+            Util.arrayFillNonAtomic(dataBuff, (short) 0, (short) (keySize - inLen), (byte) 0);
+        } else {
+            Util.arrayCopyNonAtomic(in, inOffset, dataBuff, (short) 0, keySize);
+        }
+        return keySize;
+    }
+
+    /**
      * \brief Compute a digital signature of the data from the apdu
      * 			using the private key referenced by	an earlier
      *			MANAGE SECURITY ENVIRONMENT apdu.
@@ -1748,7 +1805,8 @@ public class IsoApplet extends Applet implements ExtendedLength {
         short offset_cdata;
         short lc;
         short sigLen = 0;
-
+        ECPrivateKey ecKey;
+        short le;
 
         switch(currentAlgorithmRef[0]) {
         case ALG_RSA_PAD_PKCS1:
@@ -1783,13 +1841,13 @@ public class IsoApplet extends Applet implements ExtendedLength {
         case ALG_ECDSA_SHA1:
             // Get the key - it must be a EC private key,
             // checks have been done in MANAGE SECURITY ENVIRONMENT.
-            ECPrivateKey ecKey = (ECPrivateKey) keys[currentPrivateKeyRef[0]];
+            ecKey = (ECPrivateKey) keys[currentPrivateKeyRef[0]];
 
             // Initialisation should be done when:
             // 	- No command chaining is performed at all.
             //	- Command chaining is performed and this is the first apdu in the chain.
             if(ram_chaining_cache[RAM_CHAINING_CACHE_OFFSET_CURRENT_POS] == (short) 0) {
-                ecdsaSignature.init(ecKey, Signature.MODE_SIGN);
+                ecdsaSignatureSha1.init(ecKey, Signature.MODE_SIGN);
                 if(isCommandChainingCLA(apdu)) {
                     ram_chaining_cache[RAM_CHAINING_CACHE_OFFSET_CURRENT_POS] = (short) 1;
                 }
@@ -1802,18 +1860,56 @@ public class IsoApplet extends Applet implements ExtendedLength {
             // and aggregated in the hash. When using short APDUs, command
             // chaining is performed.
             while (recvLen > 0) {
-                ecdsaSignature.update(buf, offset_cdata, recvLen);
+                ecdsaSignatureSha1.update(buf, offset_cdata, recvLen);
                 recvLen = apdu.receiveBytes(offset_cdata);
             }
 
             if(!isCommandChainingCLA(apdu)) {
-                sigLen = ecdsaSignature.sign(buf, (short)0, (short)0, buf, (short) 0);
+                sigLen = ecdsaSignatureSha1.sign(buf, (short)0, (short)0, buf, (short) 0);
                 ram_chaining_cache[RAM_CHAINING_CACHE_OFFSET_CURRENT_POS] = (short) 0;
                 apdu.setOutgoingAndSend((short) 0, sigLen);
             } else {
                 ram_chaining_cache[RAM_CHAINING_CACHE_OFFSET_CURRENT_POS]++;
             }
+            break;
 
+        case ALG_ECDSA_PRECOMPUTED_HASH:
+            // Check if supported
+            if (ecdsaSignaturePrecomp == null) {
+                ISOException.throwIt(ISO7816.SW_FUNC_NOT_SUPPORTED);
+            }
+
+            // Receive assuming that all input data fit inside 1 APDU
+            // Bytes received must be Lc.
+            lc = apdu.setIncomingAndReceive();
+            if(lc != apdu.getIncomingLength()) {
+                ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
+            }
+            offset_cdata = apdu.getOffsetCdata();
+
+            // ECDSA signature operation.
+            ecKey = (ECPrivateKey) keys[currentPrivateKeyRef[0]];
+
+            // Not recommended (FIPS 186-4, 6.4)
+            // if (lc < MessageDigest.LENGTH_SHA_256) {
+            //     ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
+            // }
+
+            // Sign data in one go
+            ecdsaSignaturePrecomp.init(ecKey, Signature.MODE_SIGN);
+            if (ecdsaSHA512) {
+                short fittedLength = fitDataToKeyLength(ecKey.getSize() > 8*MessageDigest.LENGTH_SHA_512 ? 8*MessageDigest.LENGTH_SHA_512 : ecKey.getSize(), buf, offset_cdata, lc, ram_buf);
+                sigLen = ecdsaSignaturePrecomp.signPreComputedHash(ram_buf, (short) 0, MessageDigest.LENGTH_SHA_512, ram_buf, (short) 0);
+            } else {
+                sigLen = ecdsaSignaturePrecomp.signPreComputedHash(buf, offset_cdata, lc, ram_buf, (short) 0);
+            }
+
+            // A single short APDU can handle only 256 bytes - we use sendLargeData instead
+            le = apdu.setOutgoing();
+            if(le < sigLen) {
+                ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
+            }
+            sendLargeData(apdu, (short) 0, sigLen);
             break;
 
         default:
