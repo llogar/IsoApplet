@@ -97,6 +97,26 @@ public class IsoApplet extends Applet implements ExtendedLength {
     public static final byte INS_ERASE_CARD = (byte) 0x50;
     public static final byte INS_GET_VALUE = (byte) 0x6C;
 
+    // SC-HSM
+    // com.licel.jcardsim.card.applet.0.AID=E82B0601040181C31F0201
+    // com.licel.jcardsim.card.ATR=3BFE1800008131FE458031815448534D31738021408107FA
+    public static final boolean SCHSM = true;
+    public static final byte SCHSM_PIN_REF = (byte) 0x81;
+    public static final byte SCHSM_SOPIN_REF = (byte) 0x88;
+    public static final byte SCHSM_PIN_LENGTH = 6;
+    public static final byte SCHSM_SOPIN_LENGTH = 16;
+    public static final byte INS_SCHSM_IMPORT_DKEK_SHARE = (byte) 0x52;
+    public static final byte INS_SCHSM_UPDATE_BINARY = (byte) 0xD7;
+    public static final byte INS_SCHSM_READ_BINARY = (byte) 0xB1;
+    public static final byte INS_SCHSM_INIT_CARD = (byte) 0x50;
+    public static final byte INS_SCHSM_ENUMERATE_OBJECTS = (byte) 0x58;
+    public static final byte INS_SCHSM_SIGN = (byte) 0x68;
+    public static final byte INS_SCHSM_DECIPHER = (byte) 0x62;
+
+    // SC-HSM C_DevAut data
+    private byte[] c_DevAut = null;
+    private ECPrivateKey prk_DevAut = null;
+
     // GET VALUE P1 parameters:
     public static final byte OPT_P1_SERIAL = (byte) 0x01;
     public static final byte OPT_P1_MEM = (byte) 0x02;
@@ -107,6 +127,7 @@ public class IsoApplet extends Applet implements ExtendedLength {
     public static final short SW_COMMAND_NOT_ALLOWED_GENERAL = 0x6900;
     public static final short SW_NO_PIN_DEFINED = (short)0x9802;
     public static final short SW_AUTHENTICATION_METHOD_BLOCKED = 0x6983;
+    public static final short SW_REFERENCE_DATA_NOT_FOUND = 0x6A88;
 
     /* PIN, PUK, SO PIN and key related constants */
     // PIN:
@@ -175,7 +196,7 @@ public class IsoApplet extends Applet implements ExtendedLength {
     //		- DECIPHER (RSA >= 1024 bit).
     //		- GENERATE ASYMMETRIC KEYPAIR: ECC curve parameters if large (> 256 bit) prime fields are used.
     //		- PUT DATA: RSA and ECC private key import.
-    private static final short RAM_BUF_SIZE = (short) 660;
+    private static final short RAM_BUF_SIZE = (short) (SCHSM ? 1320 : 660);
     // "ram_chaining_cache" is used for:
     //		- Caching of the amount of bytes remainung.
     //		- Caching of the current send position.
@@ -344,9 +365,9 @@ public class IsoApplet extends Applet implements ExtendedLength {
             histBytesSet = false;
             puk_must_be_set = DEF_PUK_MUST_BE_SET;
             private_key_import_allowed = DEF_PRIVATE_KEY_IMPORT_ALLOWED;
-            pin_max_length = DEF_PIN_MAX_LENGTH;
+            pin_max_length = SCHSM ? SCHSM_PIN_LENGTH : DEF_PIN_MAX_LENGTH;
             puk_length = DEF_PUK_LENGTH;
-            sopin_length = DEF_SOPIN_LENGTH;
+            sopin_length = SCHSM ? SCHSM_SOPIN_LENGTH : DEF_SOPIN_LENGTH;
             transport_key = null;
             have_transport_key = false;
             rsaImportPrKey = null;
@@ -407,7 +428,7 @@ public class IsoApplet extends Applet implements ExtendedLength {
                 }
                 pin_max_length = bArray[++pos];
             } catch (NotFoundException e) {
-                pin_max_length = DEF_PIN_MAX_LENGTH;
+                pin_max_length = SCHSM ? SCHSM_PIN_LENGTH : DEF_PIN_MAX_LENGTH;
             }
             try {
                 pos = UtilTLV.findTag(bArray, bOff, La, TAG_PUK_LENGTH);
@@ -427,7 +448,7 @@ public class IsoApplet extends Applet implements ExtendedLength {
                 }
                 sopin_length = bArray[++pos];
             } catch (NotFoundException e) {
-                sopin_length = DEF_SOPIN_LENGTH;
+                sopin_length = SCHSM ? SCHSM_SOPIN_LENGTH : DEF_SOPIN_LENGTH;
             }
             try {
                 pos = UtilTLV.findTag(bArray, bOff, La, TAG_KEY_MAX_COUNT);
@@ -683,7 +704,7 @@ public class IsoApplet extends Applet implements ExtendedLength {
             api_features &= ~API_FEATURE_ECDH;
         }
 
-        if(DEF_EXT_APDU) {
+        if(DEF_EXT_APDU || SCHSM) {
             api_features |= API_FEATURE_EXT_APDU;
         }
 
@@ -732,6 +753,25 @@ public class IsoApplet extends Applet implements ExtendedLength {
     }
 
     /**
+     * \brief This method is called whenever the applet is being selected in SC-HSM mode
+     *
+     * Sends the SC-HSM config parameters
+     */
+    private void selectingAppletSCHSM(APDU apdu) {
+        byte buffer[] = apdu.getBuffer();
+        buffer[0] = (byte)0x6F;
+        buffer[1] = (byte)0x07;
+        buffer[2] = (byte)0x82;
+        buffer[3] = (byte)0x01;
+        buffer[4] = (byte)0x78;
+        buffer[5] = (byte)0x85;
+        buffer[6] = (byte)0x02;
+        buffer[7] = (byte)0x01;
+        buffer[8] = (byte)0x02;
+        apdu.setOutgoingAndSend((short) 0, (short) 9);
+    }
+
+    /**
      * \brief Processes an incoming APDU.
      *
      * \see APDU.
@@ -752,6 +792,11 @@ public class IsoApplet extends Applet implements ExtendedLength {
         //  - byte 1: Minor version
         //  - byte 2: Feature bitmap (used to distinguish between applet features)
         if(selectingApplet()) {
+            if (SCHSM) {
+                selectingAppletSCHSM(apdu);
+                return;
+            }
+
             // setATRHistBytes can't be invoked from constructor, so do it here.
             if (histBytes != null && !histBytesSet) {
                 Util.arrayCopyNonAtomic(histBytes, (short) 0, buffer, (short) 0, (byte) histBytes.length);
@@ -787,7 +832,7 @@ public class IsoApplet extends Applet implements ExtendedLength {
              * 	- PUT DATA
              * when not using extended APDUs.
              */
-            if( DEF_EXT_APDU ||
+            if( DEF_EXT_APDU || SCHSM ||
                     (ins != INS_PERFORM_SECURITY_OPERATION
                      && ins != INS_GENERATE_ASYMMETRIC_KEYPAIR
                      && ins != INS_GET_DATA
@@ -827,6 +872,7 @@ public class IsoApplet extends Applet implements ExtendedLength {
                 fs.processSelectFile(apdu);
                 break;
             case INS_READ_BINARY:
+            case INS_SCHSM_READ_BINARY:
                 fs.processReadBinary(apdu);
                 break;
             case INS_VERIFY:
@@ -842,13 +888,14 @@ public class IsoApplet extends Applet implements ExtendedLength {
                 fs.processCreateFile(apdu);
                 break;
             case INS_UPDATE_BINARY:
+            case INS_SCHSM_UPDATE_BINARY:
                 fs.processUpdateBinary(apdu);
                 break;
             case INS_CHANGE_REFERENCE_DATA:
                 processChangeReferenceData(apdu);
                 break;
             case INS_DELETE_FILE:
-                fs.processDeleteFile(apdu);
+                fs.processDeleteFile(apdu, SCHSM ? keys : null);
                 break;
             case INS_GENERATE_ASYMMETRIC_KEYPAIR:
                 processGenerateAsymmetricKeypair(apdu);
@@ -894,6 +941,15 @@ public class IsoApplet extends Applet implements ExtendedLength {
             case INS_GET_VALUE:
                 processGetValue(apdu);
                 break;
+            case INS_SCHSM_ENUMERATE_OBJECTS:
+                fs.processEnumerateObjects(apdu, SCHSM ? keys : null);
+                break;
+            case INS_SCHSM_SIGN:
+                processSignSCHSM(apdu);
+                break;
+            case INS_SCHSM_DECIPHER:
+                processDecipherSCHSM(apdu);
+                break;
             default:
                 ISOException.throwIt(ISO7816.SW_INS_NOT_SUPPORTED);
             }
@@ -918,6 +974,65 @@ public class IsoApplet extends Applet implements ExtendedLength {
     }
 
     /**
+     * \brief Process the VERIFY apdu (INS = 20) in SC-HSM mode.
+     *
+     * This apdu is used to verify a PIN and authenticate the user. A counter is used
+     * to limit unsuccessful tries (i.e. brute force attacks).
+     *
+     * \param apdu The apdu.
+     *
+     * \throw ISOException SW_SECURITY_STATUS_NOT_SATISFIED, ISO7816.SW_WRONG_LENGTH, SW_REFERENCE_DATA_NOT_FOUND,  SW_PIN_TRIES_REMAINING, SW_AUTHENTICATION_METHOD_BLOCKED.
+     */
+    private void processVerifySCHSM(APDU apdu) throws ISOException {
+        byte[] buf = apdu.getBuffer();
+        byte p1 = buf[ISO7816.OFFSET_P1];
+        byte p2 = buf[ISO7816.OFFSET_P2];
+        short lc;
+        short offset_cdata;
+
+        if (state == STATE_OPERATIONAL_DEACTIVATED) {
+            ISOException.throwIt(ISO7816.SW_SECURITY_STATUS_NOT_SATISFIED);
+        }
+
+        // Bytes received must be Lc.
+        lc = apdu.setIncomingAndReceive();
+        if(lc != apdu.getIncomingLength()) {
+            ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
+        }
+        offset_cdata = apdu.getOffsetCdata();
+
+        // Must be User PIN
+        if ((p2 != SCHSM_PIN_REF) || (state == STATE_CREATION)) {
+            ISOException.throwIt(SW_REFERENCE_DATA_NOT_FOUND);
+        }
+
+        // Just get remaining tries
+        if(lc == 0) {
+            if( pin.isValidated() ) {
+                ISOException.throwIt(ISO7816.SW_NO_ERROR);
+            }
+            if (pin.getTriesRemaining() > 0)
+                ISOException.throwIt((short)(SW_PIN_TRIES_REMAINING | pin.getTriesRemaining()));
+            ISOException.throwIt(SW_AUTHENTICATION_METHOD_BLOCKED);
+        }
+
+        // Invalid User PIN length
+        if(lc != SCHSM_PIN_LENGTH) {
+            ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
+        }
+
+        // Check User PIN
+        if(!pin.check(buf, offset_cdata, SCHSM_PIN_LENGTH)) {
+            fs.setUserAuthenticated(false);
+            if (pin.getTriesRemaining() > 0)
+                ISOException.throwIt((short)(SW_PIN_TRIES_REMAINING | pin.getTriesRemaining()));
+            ISOException.throwIt(SW_AUTHENTICATION_METHOD_BLOCKED);
+        }
+
+        fs.setUserAuthenticated(SCHSM_PIN_REF);
+    }
+
+    /**
      * \brief Process the VERIFY apdu (INS = 20).
      *
      * This apdu is used to verify a PIN and authenticate the user. A counter is used
@@ -932,6 +1047,11 @@ public class IsoApplet extends Applet implements ExtendedLength {
         short offset_cdata;
         short lc;
         byte ref = buf[ISO7816.OFFSET_P2];
+
+        if (SCHSM) {
+            processVerifySCHSM(apdu);
+            return;
+        }
 
         /* P1 FF means logout. */
         if (buf[ISO7816.OFFSET_P1] == (byte)0xFF) {
@@ -1041,6 +1161,91 @@ public class IsoApplet extends Applet implements ExtendedLength {
     }
 
     /**
+     * \brief convertSOPIN_SCHSM helper function
+     */
+    private byte hex2ascii(byte b) {
+        return b > '9' ? (byte)('A' + b - 10) : (byte)('0' + b);
+    }
+
+    /**
+     * \brief Convert SC-HSM SOPIN to friendlier form
+     */
+    private short convertSOPIN_SCHSM(byte[] src, short pos, byte[] dst) {
+            for (short n = 0; n < SCHSM_SOPIN_LENGTH/2; n++) {
+                dst[(short)(n*2 + 0)] = hex2ascii((byte)(src[(short)(pos + n)] >> 4));
+                dst[(short)(n*2 + 1)] = hex2ascii((byte)(src[(short)(pos + n)] & 0x0F));
+            }
+            return SCHSM_SOPIN_LENGTH;
+    }
+
+    /**
+     * \brief Process the CHANGE REFERENCE DATA apdu (INS = 24) in SC-HSM mode.
+     *
+     * In a "later" state the user must authenticate himself to be able to change the PIN.
+     *
+     * \param apdu The apdu.
+     *
+     * \throws ISOException ISO7816.SW_WRONG_LENGTH, ISO7816.SW_CONDITIONS_NOT_SATISFIED, ISO7816.SW_INCORRECT_P1P2,
+     *			SW_AUTHENTICATION_METHOD_BLOCKED, SW_PIN_TRIES_REMAINING, SW_REFERENCE_DATA_NOT_FOUND
+     */
+    private void processChangeReferenceDataSCHSM(APDU apdu) throws ISOException {
+        byte[] buf = apdu.getBuffer();
+        byte p1 = buf[ISO7816.OFFSET_P1];
+        byte p2 = buf[ISO7816.OFFSET_P2];
+        short lc;
+        short offset_cdata;
+
+        // Bytes received must be Lc.
+        lc = apdu.setIncomingAndReceive();
+        if(lc != apdu.getIncomingLength()) {
+            ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
+        }
+        offset_cdata = apdu.getOffsetCdata();
+
+        if(state == STATE_CREATION) {
+            ISOException.throwIt(ISO7816.SW_CONDITIONS_NOT_SATISFIED);
+        }
+
+        if (p1 != 0x00) {
+            ISOException.throwIt(ISO7816.SW_INCORRECT_P1P2);
+        }
+
+        if (p2 == SCHSM_PIN_REF) {
+            if (lc != 2*SCHSM_PIN_LENGTH) {
+                ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
+            }
+            if (!pin.check(buf, offset_cdata, SCHSM_PIN_LENGTH)) {
+                if (pin.getTriesRemaining() > 0)
+                    ISOException.throwIt((short)(SW_PIN_TRIES_REMAINING | pin.getTriesRemaining()));
+                ISOException.throwIt(SW_AUTHENTICATION_METHOD_BLOCKED);
+            }
+            pin.update(buf, (byte)(offset_cdata + SCHSM_PIN_LENGTH), SCHSM_PIN_LENGTH);
+            pin.resetAndUnblock();
+        } else if (p2 == SCHSM_SOPIN_REF) {
+            if (lc != 2*SCHSM_SOPIN_LENGTH/2) {
+                ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
+            }
+            if (convertSOPIN_SCHSM(buf, offset_cdata, ram_buf) != SCHSM_SOPIN_LENGTH) {
+                ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
+            }
+            if (!sopin.check(ram_buf, (byte) 0, SCHSM_SOPIN_LENGTH)) {
+                if (sopin.getTriesRemaining() > 0)
+                    ISOException.throwIt((short)(SW_PIN_TRIES_REMAINING | sopin.getTriesRemaining()));
+                state = STATE_TERMINATED;
+                ISOException.throwIt(SW_AUTHENTICATION_METHOD_BLOCKED);
+            }
+            if (convertSOPIN_SCHSM(buf, (byte)(offset_cdata + SCHSM_SOPIN_LENGTH/2), ram_buf) != SCHSM_SOPIN_LENGTH) {
+                ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
+            }
+            sopin.update(ram_buf, (byte) 0, SCHSM_SOPIN_LENGTH);
+            sopin.resetAndUnblock();
+        } else {
+                ISOException.throwIt(SW_REFERENCE_DATA_NOT_FOUND);
+        }
+
+    }
+
+    /**
      * \brief Process the CHANGE REFERENCE DATA apdu (INS = 24).
      *
      * If the state is STATE_CREATION, we can set the SO PIN without verification.
@@ -1057,6 +1262,11 @@ public class IsoApplet extends Applet implements ExtendedLength {
         byte p2 = buf[ISO7816.OFFSET_P2];
         short lc;
         short offset_cdata;
+
+        if (SCHSM) {
+            processChangeReferenceDataSCHSM(apdu);
+            return;
+        }
 
         // Bytes received must be Lc.
         lc = apdu.setIncomingAndReceive();
@@ -1205,6 +1415,72 @@ public class IsoApplet extends Applet implements ExtendedLength {
     }// end processChangeReferenceData()
 
     /**
+     * \brief Process the RESET RETRY COUNTER apdu (INS = 2C) in SC-HSM mode.
+     *
+     * This is used to unblock the PIN with the PUK and set a new PIN value.
+     *
+     * \param apdu The RESET RETRY COUNTER apdu.
+     *
+     * \throw ISOException SW_WRONG_LENGTH, SW_REFERENCE_DATA_NOT_FOUND, SW_PIN_TRIES_REMAINING, SW_AUTHENTICATION_METHOD_BLOCKED
+     *			SW_INCORRECT_P1P2
+     */
+    private void processResetRetryCounterSCHSM(APDU apdu) {
+        byte[] buf = apdu.getBuffer();
+        byte p1 = buf[ISO7816.OFFSET_P1];
+        byte p2 = buf[ISO7816.OFFSET_P2];
+        short lc;
+        short offset_cdata;
+
+        // Bytes received must be Lc.
+        lc = apdu.setIncomingAndReceive();
+        if(lc != apdu.getIncomingLength()) {
+            ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
+        }
+        offset_cdata = apdu.getOffsetCdata();
+
+        if (p2 != SCHSM_PIN_REF) {
+            ISOException.throwIt(SW_REFERENCE_DATA_NOT_FOUND);
+        }
+
+        if (p1 == 0x00) {
+            if (lc != (SCHSM_PIN_LENGTH + SCHSM_SOPIN_LENGTH/2)) {
+                ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
+            }
+            if (convertSOPIN_SCHSM(buf, offset_cdata, ram_buf) != SCHSM_SOPIN_LENGTH ) {
+                ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
+            }
+            if (!sopin.check(ram_buf, (byte) 0, SCHSM_SOPIN_LENGTH)) {
+                fs.setUserAuthenticated(false);
+                if (sopin.getTriesRemaining() > 0)
+                    ISOException.throwIt((short)(SW_PIN_TRIES_REMAINING | sopin.getTriesRemaining()));
+                state = STATE_TERMINATED;
+                ISOException.throwIt(SW_AUTHENTICATION_METHOD_BLOCKED);
+            }
+            pin.update(buf, (short)(offset_cdata + SCHSM_SOPIN_LENGTH/2),SCHSM_PIN_LENGTH);
+            pin.resetAndUnblock();
+            if (state == STATE_INITIALISATION) {
+                state = STATE_OPERATIONAL_ACTIVATED;
+            }
+        } else if (p1 == 0x01) {
+            if (lc != SCHSM_SOPIN_LENGTH/2) {
+                ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
+            }
+            if (convertSOPIN_SCHSM(buf, offset_cdata, ram_buf) != SCHSM_SOPIN_LENGTH) {
+                ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
+            }
+            if (!sopin.check(ram_buf, (byte) 0, SCHSM_SOPIN_LENGTH)) {
+                fs.setUserAuthenticated(false);
+                if (sopin.getTriesRemaining() > 0)
+                    ISOException.throwIt((short)(SW_PIN_TRIES_REMAINING | sopin.getTriesRemaining()));
+                state = STATE_TERMINATED;
+                ISOException.throwIt(SW_AUTHENTICATION_METHOD_BLOCKED);
+            }
+        } else {
+            ISOException.throwIt(ISO7816.SW_INCORRECT_P1P2);
+        }
+    }
+
+    /**
      * \brief Process the RESET RETRY COUNTER apdu (INS = 2C).
      *
      * This is used to unblock the PIN with the PUK and set a new PIN value.
@@ -1220,6 +1496,11 @@ public class IsoApplet extends Applet implements ExtendedLength {
         byte p2 = buf[ISO7816.OFFSET_P2];
         short lc;
         short offset_cdata;
+
+        if (SCHSM) {
+            processResetRetryCounterSCHSM(apdu);
+            return;
+        }
 
         if(state != STATE_OPERATIONAL_ACTIVATED) {
             ISOException.throwIt(ISO7816.SW_COMMAND_NOT_ALLOWED);
@@ -1255,6 +1536,35 @@ public class IsoApplet extends Applet implements ExtendedLength {
         // Set the PIN.
         pin.update(buf, (short)(offset_cdata+puk_length), pin_max_length);
         pin.resetAndUnblock();
+    }
+
+    /**
+     * \brief Initialize a RSA public key with the parameters from buf.
+     *
+     * \param buf The buffer containing the RSA parameters. It must be TLV with the following format:
+     * 				82 - public exponent
+     *
+     * \param bOff The offset at where the first entry is located.
+     *
+     * \param bLen The remaining length of buf.
+     *
+     * \param key The RSA public key to initialize.
+     *
+     * \throw NotFoundException Parts of the data needed to fully initialize
+     *                          the key were missing.
+     *
+     * \throw InvalidArgumentsException The ASN.1 sequence was malformatted.
+     */
+    private void initRsaParams(byte[] buf, short bOff, short bLen, RSAPublicKey key) throws NotFoundException, InvalidArgumentsException {
+        short pos = bOff;
+        short len;
+
+        /* Search for the public exponent */
+        pos = UtilTLV.findTag(buf, bOff, bLen, (byte) 0x82);
+        pos++;
+        len = UtilTLV.decodeLengthField(buf, pos);
+        pos += UtilTLV.getLengthFieldLength(len);
+        key.setExponent(buf, pos, len); // "public exponent"
     }
 
     /**
@@ -1333,6 +1643,553 @@ public class IsoApplet extends Applet implements ExtendedLength {
     }
 
     /**
+     * \brief Return Certificate Holder Reference (CHR) from c_DevAut
+     *
+     * \param data buffer to search for CHR
+     *
+     * \param dest buffer to store CHR to
+     *
+     * \param chrPos offset to store CHR at
+     *
+     * returns CHR length
+     */
+    private short getCHR(byte[] data, byte[] dest, short chrPos) {
+        short pos = 0, len = (short)data.length;
+        short cbPos = 0, cbLen = 0;
+        try {
+            // Cardholder certificate
+            pos = UtilTLV.findTag(data, pos, (short)(len - pos), (byte) 0x7F);
+            if (data[++pos] != 0x21) {
+                throw NotFoundException.getInstance();
+            }
+            len = UtilTLV.decodeLengthField(data, ++pos);
+            pos += UtilTLV.getLengthFieldLength(len);
+
+            // Certificate body
+            cbPos = UtilTLV.findTag(data, pos, len, (byte) 0x7F);
+            if (data[++cbPos] != 0x4E) {
+                throw NotFoundException.getInstance();
+            }
+            cbLen = UtilTLV.decodeLengthField(data, ++cbPos);
+            cbPos += UtilTLV.getLengthFieldLength(cbLen);
+
+            // Certificate profile identifier
+            pos = UtilTLV.findTag(data, cbPos, cbLen, (byte) 0x5F);
+            if (data[++pos] != 0x29) {
+                throw NotFoundException.getInstance();
+            }
+            len = UtilTLV.decodeLengthField(data, ++pos);
+            pos += UtilTLV.getLengthFieldLength(len);
+            pos += len;
+
+            // Certification authority reference
+            pos = UtilTLV.findTag(data, pos, (short)(cbLen - (pos - cbPos)), (byte) 0x42);
+            len = UtilTLV.decodeLengthField(data, ++pos);
+            pos += UtilTLV.getLengthFieldLength(len);
+            pos += len;
+
+            // Public key
+            pos = UtilTLV.findTag(data, pos, (short)(cbLen - (pos - cbPos)), (byte) 0x7F);
+            if (data[++pos] != 0x49) {
+                throw NotFoundException.getInstance();
+            }
+            len = UtilTLV.decodeLengthField(data, ++pos);
+            pos += UtilTLV.getLengthFieldLength(len);
+            pos += len;
+
+            // Certification holder reference
+            pos = UtilTLV.findTag(data, pos, (short)(cbLen - (pos - cbPos)), (byte) 0x5F);
+            if (data[++pos] != 0x20) {
+                throw NotFoundException.getInstance();
+            }
+            len = UtilTLV.decodeLengthField(data, ++pos);
+            pos += UtilTLV.getLengthFieldLength(len);
+
+            Util.arrayCopy(data, pos, dest, chrPos, len);
+        } catch (NotFoundException e) {
+            ISOException.throwIt(ISO7816.SW_DATA_INVALID);
+        } catch (InvalidArgumentsException e) {
+            ISOException.throwIt(ISO7816.SW_DATA_INVALID);
+        }
+
+        return len;
+    }
+
+    /**
+     * \brief Convert OpenSSL ECDSA signature to RS format
+     *
+     * \param data buffer that holds input signature
+     *
+     * \param sigPos offset into buffer
+     *
+     * \param sigLen signature length
+     *
+     * returns RS length
+     */
+    private short signature2rs(byte[] data, short sigPos, short sigLen) {
+        short pos = 0, len = 0;
+        short rPos = 0, rLen = 0;
+        short sPos = 0, sLen = 0;
+
+        try {
+            pos = UtilTLV.findTag(data, sigPos, sigLen, (byte) 0x30);
+            len = UtilTLV.decodeLengthField(data, ++pos);
+            pos += UtilTLV.getLengthFieldLength(len);
+
+            // Get R
+            pos = UtilTLV.findTag(data, pos, (short)(sigLen - (pos - sigPos)), (byte) 0x2);
+            len = UtilTLV.decodeLengthField(data, ++pos);
+            pos += UtilTLV.getLengthFieldLength(len);
+            rPos = pos;
+            rLen = len;
+            if (data[rPos] == 0x00) {
+                pos++;
+                rPos++;
+                rLen--;
+            }
+
+            // Get S
+            pos += rLen;
+            pos = UtilTLV.findTag(data, pos, (short)(sigLen - (pos - sigPos)), (byte) 0x2);
+            len = UtilTLV.decodeLengthField(data, ++pos);
+            pos += UtilTLV.getLengthFieldLength(len);
+            sPos = pos;
+            sLen = len;
+            if (data[sPos] == 0x00) {
+                pos++;
+                sPos++;
+                sLen--;
+            }
+
+            // Concatenate RS
+            Util.arrayCopy(data, rPos, data, sigPos, rLen);
+            Util.arrayCopy(data, sPos, data, (short)(sigPos + rLen), sLen);
+        } catch (Exception e) {
+            rLen = 0;
+            sLen = 0;
+        }
+
+        return (short)(rLen + sLen);
+    }
+
+    /**
+     * \brief Sign SC-HSM Authenticated Request using RSA private key
+     */
+    private short signRequestRSA(RSAPrivateCrtKey privKey, short inPos, short inLen, short outPos) {
+        Signature sign = Signature.getInstance(Signature.ALG_RSA_SHA_256_PKCS1, false);
+        sign.init(privKey, Signature.MODE_SIGN);
+        return sign.sign(ram_buf, inPos, inLen, ram_buf, outPos);
+    }
+
+    /**
+     * \brief Sign SC-HSM Authenticated Request using ECC private key and convert it to RS format
+     */
+    private short signRequestEC(ECPrivateKey privKey, short inPos, short inLen, short outPos) {
+        short outLen;
+
+        Signature sign = Signature.getInstance(Signature.ALG_ECDSA_SHA_256, false);
+        sign.init(privKey, Signature.MODE_SIGN);
+        outLen = sign.sign(ram_buf, inPos, inLen, ram_buf, outPos);
+
+        return signature2rs(ram_buf, outPos, outLen);
+    }
+
+    /**
+     * \brief Move tag value to fill the unused length data
+     */
+    private short adjustTagPos(byte[] data, short tag, short pos, short len) throws InvalidArgumentsException {
+        short deltaLen = (short)(3 - UtilTLV.getLengthFieldLength(len));
+        if (deltaLen != 0) {
+            short tagLen = tag > 0xFF ? (short)2 : (short)1;
+            Util.arrayCopy(data, (short)(pos + tagLen + 3), data, (short)(pos + tagLen + 3 - deltaLen), len);
+        }
+        return deltaLen;
+    }
+
+    /**
+     * \brief Process the GENERATE ASYMMETRIC KEY PAIR apdu (INS = 46) in SC-HSM mode
+     *
+     * \param apdu The apdu.
+     *
+     * \throw ISOException SW_SECURITY_STATUS_NOT_SATISFIED, SW_INCORRECT_P1P2, SW_DATA_INVALID, SW_FUNC_NOT_SUPPORTED
+     */
+    public void processGenerateAsymmetricKeypairSCHSM(APDU apdu) throws ISOException {
+        byte[] buf = apdu.getBuffer();
+        byte p1 = buf[ISO7816.OFFSET_P1];
+        byte p2 = buf[ISO7816.OFFSET_P2];
+        short offset_cdata;
+        short pos, len;
+        short cpiPos = 0, cpiLen = 0;
+        short carPos = 0, carLen = 0;
+        short pkaPos = 0, pkaLen = 0;
+        boolean ecc = false, rsa = false;
+        short chrPos = 0, chrLen = 0;
+        short primePos = 0, primeLen = 0;
+        short rsaLenPos = 0, rsaLenLen = 0;
+        short sigPos = 0, sigLen = 0;
+        KeyPair kp = null;
+        ECPrivateKey privKeyEC = null;
+        ECPublicKey pubKeyEC = null;
+        RSAPrivateCrtKey privKeyRSA = null;
+        RSAPublicKey pubKeyRSA = null;
+
+        if( ! pin.isValidated() && state != STATE_CREATION ) {
+            ISOException.throwIt(ISO7816.SW_SECURITY_STATUS_NOT_SATISFIED);
+        }
+
+        if(p2 != (byte) 0x00) {
+            ISOException.throwIt(ISO7816.SW_INCORRECT_P1P2);
+        }
+
+        len = doChainingOrExtAPDU(apdu);
+        pos = 0;
+
+        short privKeyRef = p1;
+        if (privKeyRef < 0 || privKeyRef >= key_max_count) {
+            ISOException.throwIt(ISO7816.SW_DATA_INVALID);
+        }
+
+        try {
+            // Certificate profile Identifier (CPI)
+            cpiPos = UtilTLV.findTag(ram_buf, pos, (short)(len - pos), (byte) 0x5F);
+            if (ram_buf[++cpiPos] != 0x29) {
+                throw NotFoundException.getInstance();
+            }
+            cpiLen = UtilTLV.decodeLengthField(ram_buf, ++cpiPos);
+            cpiPos += UtilTLV.getLengthFieldLength(cpiLen);
+            pos = (short)(cpiPos + cpiLen);
+
+            // Certification authority reference (CAR)
+            carPos = UtilTLV.findTag(ram_buf, pos, (short)(len - pos), (byte) 0x42);
+            carLen = UtilTLV.decodeLengthField(ram_buf, ++carPos);
+            carPos += UtilTLV.getLengthFieldLength(carLen);
+            pos = (short)(carPos + carLen);
+
+            // Public Key Algorithm (PKA)
+            pkaPos = UtilTLV.findTag(ram_buf, pos, (short)(len - pos), (byte) 0x7F);
+            if (ram_buf[++pkaPos] != 0x49) {
+                throw NotFoundException.getInstance();
+            }
+            pkaLen = UtilTLV.decodeLengthField(ram_buf, ++pkaPos);
+            pkaPos += UtilTLV.getLengthFieldLength(pkaLen);
+            pos = (short)(pkaPos + pkaLen);
+
+            // Certificate Holder Reference (CHR)
+            chrPos = UtilTLV.findTag(ram_buf, pos, (short)(len - pos), (byte) 0x5F);
+            if (ram_buf[++chrPos] != 0x20) {
+                throw NotFoundException.getInstance();
+            }
+            chrLen = UtilTLV.decodeLengthField(ram_buf, ++chrPos);
+            chrPos += UtilTLV.getLengthFieldLength(chrLen);
+            pos = (short)(chrPos + chrLen);
+
+            // Get key type
+            if ((ram_buf[pkaPos] != 0x06) || (ram_buf[(short)(pkaPos + 1)] != 0x0A)) {
+                throw InvalidArgumentsException.getInstance();
+            }
+            if (ram_buf[(short)(pkaPos + 10)] == 0x01) {
+                rsa = true;
+            } else if (ram_buf[(short)(pkaPos + 10)] == 0x02) {
+                ecc = true;
+            } else {
+                throw InvalidArgumentsException.getInstance();
+            }
+
+            if (rsa) {
+                /* Search for keylength tag 0x02 */
+                rsaLenPos = UtilTLV.findTag(ram_buf, pkaPos, pkaLen, (byte) 0x02);
+                rsaLenLen = UtilTLV.decodeLengthField(ram_buf, ++rsaLenPos);
+                if (rsaLenLen != 2) {
+                    throw InvalidArgumentsException.getInstance();
+                }
+            }
+            if (ecc) {
+                /* Search for prime */
+                primePos = UtilTLV.findTag(ram_buf, pkaPos, pkaLen, (byte) 0x81);
+                primeLen = UtilTLV.decodeLengthField(ram_buf, ++primePos);
+            }
+        } catch (NotFoundException e) {
+            ISOException.throwIt(ISO7816.SW_DATA_INVALID);
+        } catch (InvalidArgumentsException e) {
+            ISOException.throwIt(ISO7816.SW_DATA_INVALID);
+        }
+
+        if (rsa) {
+            short rsa_len = Util.getShort(ram_buf, ++rsaLenPos);
+
+            // Try to instantiate key objects of that length
+            try {
+                privKeyRSA = (RSAPrivateCrtKey) KeyBuilder.buildKey(KeyBuilder.TYPE_RSA_CRT_PRIVATE, rsa_len, false);
+                pubKeyRSA = (RSAPublicKey) KeyBuilder.buildKey(KeyBuilder.TYPE_RSA_PUBLIC, rsa_len, false);
+                kp = new KeyPair(pubKeyRSA, privKeyRSA);
+            } catch(CryptoException e) {
+                if(e.getReason() == CryptoException.NO_SUCH_ALGORITHM) {
+                    ISOException.throwIt(ISO7816.SW_FUNC_NOT_SUPPORTED);
+                }
+                ISOException.throwIt(ISO7816.SW_UNKNOWN);
+            }
+            try {
+                initRsaParams(ram_buf, pkaPos, pkaLen, pubKeyRSA);
+            } catch (NotFoundException e) {
+                // Parts of the data needed to initialize the RSA keys were missing.
+                ISOException.throwIt(ISO7816.SW_DATA_INVALID);
+            } catch (InvalidArgumentsException e) {
+                // Malformatted ASN.1.
+                ISOException.throwIt(ISO7816.SW_DATA_INVALID);
+            }
+            try {
+                kp.genKeyPair();
+            } catch (CryptoException e) {
+                if(e.getReason() == CryptoException.ILLEGAL_VALUE) {
+                    ISOException.throwIt(ISO7816.SW_DATA_INVALID);
+                }
+            }
+            if(keys[privKeyRef] != null) {
+                keys[privKeyRef].clearKey();
+            }
+            keys[privKeyRef] = privKeyRSA;
+        }
+        if (ecc) {
+            short field_len = getEcFpFieldLength(primeLen);
+
+            // Try to instantiate key objects of that length
+            try {
+                privKeyEC = (ECPrivateKey) KeyBuilder.buildKey(KeyBuilder.TYPE_EC_FP_PRIVATE, field_len, false);
+                pubKeyEC = (ECPublicKey) KeyBuilder.buildKey(KeyBuilder.TYPE_EC_FP_PUBLIC, field_len, false);
+                kp = new KeyPair(pubKeyEC, privKeyEC);
+            } catch(CryptoException e) {
+                if(e.getReason() == CryptoException.NO_SUCH_ALGORITHM) {
+                    ISOException.throwIt(ISO7816.SW_FUNC_NOT_SUPPORTED);
+                }
+                ISOException.throwIt(ISO7816.SW_UNKNOWN);
+            }
+            try {
+                initEcParams(ram_buf, pkaPos, pkaLen, pubKeyEC);
+                initEcParams(ram_buf, pkaPos, pkaLen, privKeyEC);
+            } catch (NotFoundException e) {
+                // Parts of the data needed to initialize the EC keys were missing.
+                ISOException.throwIt(ISO7816.SW_DATA_INVALID);
+            } catch (InvalidArgumentsException e) {
+                // Malformatted ASN.1.
+                ISOException.throwIt(ISO7816.SW_DATA_INVALID);
+            }
+            try {
+                kp.genKeyPair();
+            } catch (CryptoException e) {
+                if(e.getReason() == CryptoException.ILLEGAL_VALUE) {
+                    ISOException.throwIt(ISO7816.SW_DATA_INVALID);
+                }
+            }
+            if(keys[privKeyRef] != null) {
+                keys[privKeyRef].clearKey();
+            }
+            keys[privKeyRef] = privKeyEC;
+            if (state == STATE_CREATION) {
+                /* We can reuse pkaPos as scratch buffer for cloneKey() */
+                prk_DevAut = cloneKey(privKeyEC, pkaPos);
+            }
+        }
+        if(JCSystem.isObjectDeletionSupported()) {
+            JCSystem.requestObjectDeletion();
+        }
+
+        // Make room for response data, move CHR to PKA location as we don't need PKA any more
+        pos = Util.arrayCopy(ram_buf, chrPos, ram_buf, pkaPos, chrLen);
+        chrPos = pkaPos;
+
+        // Start of output buffer, right after input buffer
+        short pos0 = pos;
+
+        try {
+            // authenticated request (AR)
+            short arPos = pos, arLen = 0x100;
+            pos += UtilTLV.writeTagAndLen((byte) 0x67, arLen, ram_buf, pos);
+
+            // Certificate (CRT)
+            short crtPos = pos, crtLen = 0x100;
+            pos += UtilTLV.writeTagAndLen((short) 0x7F21, crtLen, ram_buf, pos);
+
+            // Certifiicate body (CB)
+            short cbPos = pos, cbLen = 0x100;
+            pos += UtilTLV.writeTagAndLen((short) 0x7F4E, cbLen, ram_buf, pos);
+
+            // Certificate profile Identifier (CPI)
+            pos += UtilTLV.writeTagAndLen((short) 0x5F29, cpiLen, ram_buf, pos);
+            pos = Util.arrayCopy(ram_buf, cpiPos, ram_buf, pos, cpiLen);
+
+            // Certification authority reference (CAR)
+            pos += UtilTLV.writeTagAndLen((short) 0x42, carLen, ram_buf, pos);
+            pos = Util.arrayCopy(ram_buf, carPos, ram_buf, pos, carLen);
+
+            // Public Key Algorithm (PKA)
+            if (rsa) {
+                pos = encodeRSAPublicKey(pubKeyRSA, pos);
+            }
+            if (ecc) {
+                pos = encodeECPublicKey(pubKeyEC, pos);
+            }
+
+            // Certificate Holder Reference (CHR)
+            pos += UtilTLV.writeTagAndLen((short) 0x5F20, chrLen, ram_buf, pos);
+            pos = Util.arrayCopy(ram_buf, chrPos, ram_buf, pos, chrLen);
+
+            // Certificate body up to here
+            cbLen = (short)(pos - (cbPos + 2 + UtilTLV.getLengthFieldLength(cbLen)));
+            // Fix Certificate body tag len
+            UtilTLV.writeTagAndLen((short) 0x7F4E, cbLen, ram_buf, cbPos);
+            pos -= adjustTagPos(ram_buf, (short) 0x7F4E, cbPos, cbLen);
+
+            // Digital signature (SIG) with the new key
+            sigPos = (short)(pos + 5);
+            sigLen = (short)(2 + UtilTLV.getLengthFieldLength(cbLen) + cbLen);
+            if (rsa) {
+                sigLen = signRequestRSA(privKeyRSA, cbPos, sigLen, sigPos);
+            }
+            if (ecc) {
+                sigLen = signRequestEC(privKeyEC, cbPos, sigLen, sigPos);
+            }
+            pos += UtilTLV.writeTagAndLen((short) 0x5F37, sigLen, ram_buf, pos);
+            pos = Util.arrayCopy(ram_buf, sigPos, ram_buf, pos, sigLen);
+
+            // Certificate up to here
+            crtLen = (short)(pos - (crtPos + 2 + UtilTLV.getLengthFieldLength(crtLen)));
+            // Fix Certificate tag len
+            UtilTLV.writeTagAndLen((short) 0x7F21, crtLen, ram_buf, crtPos);
+            pos -= adjustTagPos(ram_buf, (short) 0x7F21, crtPos, crtLen);
+
+            if (state != STATE_CREATION) {
+                // DevAut CHR as CAR
+                chrPos = (short)(pos + 5);
+                chrLen = getCHR(c_DevAut, ram_buf, chrPos);
+                pos += UtilTLV.writeTagAndLen((short) 0x42, chrLen, ram_buf, pos);
+                pos = Util.arrayCopy(ram_buf, chrPos, ram_buf, pos, chrLen);
+                // Outer digital signature (SIG) with prk_DevAut
+                sigPos = (short)(pos + 5);
+                sigLen = (short)((2 + UtilTLV.getLengthFieldLength(crtLen) + crtLen) + (1 + UtilTLV.getLengthFieldLength(chrLen) + chrLen));
+                // Sign with prk_DevAut and write tag
+                sigLen = signRequestEC(prk_DevAut, crtPos, sigLen, sigPos);
+                pos += UtilTLV.writeTagAndLen((short) 0x5F37, sigLen, ram_buf, pos);
+                pos = Util.arrayCopy(ram_buf, sigPos, ram_buf, pos, sigLen);
+            }
+
+            // Authenticated request up to here
+            arLen = (short)(pos - (arPos + 1 + UtilTLV.getLengthFieldLength(arLen)));
+            // authenticatedrequest
+            UtilTLV.writeTagAndLen((byte) 0x67, arLen, ram_buf, arPos);
+            pos -= adjustTagPos(ram_buf, (byte) 0x67, arPos, arLen);
+        } catch (InvalidArgumentsException e) {
+            ISOException.throwIt(ISO7816.SW_DATA_INVALID);
+        } catch (NotEnoughSpaceException e) {
+            ISOException.throwIt(ISO7816.SW_DATA_INVALID);
+        }
+
+        // Store DevAut key
+        ram_chaining_cache[RAM_CHAINING_CACHE_OFFSET_CURRENT_POS] = 0;
+        apdu.setOutgoing();
+        sendLargeData(apdu, pos0, (short)(pos - pos0));
+    }
+
+    /**
+     * \brief Import SC-HSM DevAut key from initial 2F02 file
+     *
+     * \param apdu The apdu.
+     *
+     * \throw ISOException SW_DATA_INVALID
+     */
+    public short importDevAutKeySCHSM(byte[] data) throws ISOException {
+        short pos = 0, len = (short)data.length;
+        short cpiPos = 0, cpiLen = 0;
+        short carPos = 0, carLen = 0;
+        short prkPos = 0, prkLen = 0;
+        short pkaPos = 0, pkaLen = 0;
+        short chrPos = 0, chrLen = 0;
+        short primePos = 0, primeLen = 0;
+        short sPos = 0, sLen = 0;
+
+        try {
+            // Certificate profile Identifier (CPI)
+            cpiPos = UtilTLV.findTag(data, pos, (short)(len - pos), (byte) 0x5F);
+            if (data[++cpiPos] != 0x29) {
+                throw NotFoundException.getInstance();
+            }
+            cpiLen = UtilTLV.decodeLengthField(data, ++cpiPos);
+            cpiPos += UtilTLV.getLengthFieldLength(cpiLen);
+            pos = (short)(cpiPos + cpiLen);
+
+            // Certification authority reference (CAR)
+            carPos = UtilTLV.findTag(data, pos, (short)(len - pos), (byte) 0x42);
+            carLen = UtilTLV.decodeLengthField(data, ++carPos);
+            carPos += UtilTLV.getLengthFieldLength(carLen);
+            pos = (short)(carPos + carLen);
+
+            // Private Key wrapper
+            prkPos = UtilTLV.findTag(data, pos, (short)(len - pos), (byte) 0x7F);
+            if (data[++prkPos] != 0x48) {
+                throw NotFoundException.getInstance();
+            }
+            prkLen = UtilTLV.decodeLengthField(data, ++prkPos);
+            prkPos += UtilTLV.getLengthFieldLength(prkLen);
+            pos = (short)(prkPos + prkLen);
+
+            // Private key
+            sPos = UtilTLV.findTag(data, prkPos, prkLen, (byte) 0x88);
+            sLen = UtilTLV.decodeLengthField(data, ++sPos);
+
+            // Public Key Algorithm (PKA)
+            pkaPos = UtilTLV.findTag(data, pos, (short)(len - pos), (byte) 0x7F);
+            if (data[++pkaPos] != 0x49) {
+                throw NotFoundException.getInstance();
+            }
+            pkaLen = UtilTLV.decodeLengthField(data, ++pkaPos);
+            pkaPos += UtilTLV.getLengthFieldLength(pkaLen);
+            pos = (short)(pkaPos + pkaLen);
+
+            // Certificate Holder Reference (CHR)
+            chrPos = UtilTLV.findTag(data, pos, (short)(len - pos), (byte) 0x5F);
+            if (data[++chrPos] != 0x20) {
+                throw NotFoundException.getInstance();
+            }
+            chrLen = UtilTLV.decodeLengthField(data, ++chrPos);
+            chrPos += UtilTLV.getLengthFieldLength(chrLen);
+            pos = (short)(chrPos + chrLen);
+
+            // Search for prime
+            primePos = UtilTLV.findTag(data, pkaPos, pkaLen, (byte) 0x81);
+            primeLen = UtilTLV.decodeLengthField(data, ++primePos);
+        } catch (NotFoundException e) {
+            ISOException.throwIt(ISO7816.SW_DATA_INVALID);
+        } catch (InvalidArgumentsException e) {
+            ISOException.throwIt(ISO7816.SW_DATA_INVALID);
+        }
+
+        short field_len = getEcFpFieldLength(primeLen);
+
+        // Try to instantiate key objects of that length
+        try {
+            prk_DevAut = (ECPrivateKey) KeyBuilder.buildKey(KeyBuilder.TYPE_EC_FP_PRIVATE, field_len, false);
+        } catch(CryptoException e) {
+            if(e.getReason() == CryptoException.NO_SUCH_ALGORITHM) {
+                ISOException.throwIt(ISO7816.SW_FUNC_NOT_SUPPORTED);
+            }
+            ISOException.throwIt(ISO7816.SW_UNKNOWN);
+        }
+        try {
+            initEcParams(data, pkaPos, pkaLen, prk_DevAut);
+            prk_DevAut.setS(data, ++sPos, sLen);
+            // Zeroize private key
+            Util.arrayFillNonAtomic(data, (short)0, pos, (byte)0x00);
+        } catch (NotFoundException e) {
+            // Parts of the data needed to initialize the EC keys were missing.
+            ISOException.throwIt(ISO7816.SW_DATA_INVALID);
+        } catch (InvalidArgumentsException e) {
+            // Malformatted ASN.1.
+            ISOException.throwIt(ISO7816.SW_DATA_INVALID);
+        }
+
+        return pos;
+    }
+
+    /**
      * \brief Process the GENERATE ASYMMETRIC KEY PAIR apdu (INS = 46).
      *
      * A MANAGE SECURITY ENVIRONMENT must have succeeded earlier to set parameters for key
@@ -1352,6 +2209,11 @@ public class IsoApplet extends Applet implements ExtendedLength {
         KeyPair kp = null;
         ECPrivateKey privKey = null;
         ECPublicKey pubKey = null;
+
+        if (SCHSM) {
+            processGenerateAsymmetricKeypairSCHSM(apdu);
+            return;
+        }
 
         if( ! pin.isValidated() ) {
             ISOException.throwIt(ISO7816.SW_SECURITY_STATUS_NOT_SATISFIED);
@@ -1588,7 +2450,7 @@ public class IsoApplet extends Applet implements ExtendedLength {
             ISOException.throwIt(ISO7816.SW_UNKNOWN);
         }
 
-        if(DEF_EXT_APDU) {
+        if(DEF_EXT_APDU || SCHSM) {
             apdu.setOutgoingLength(len);
             apdu.sendBytesLong(ram_buf, pos, len);
         } else {
@@ -1742,6 +2604,170 @@ public class IsoApplet extends Applet implements ExtendedLength {
     }
 
     /**
+     * \brief Encode a RSAPublicKey in a SC-HSM fashion
+     *
+     * \throw InvalidArgumentsException Field length of the RSA key provided can not be handled.
+     *
+     * \throw NotEnoughSpaceException ram_buf is too small to contain the EC key to send.
+     */
+    private short encodeRSAPublicKey(RSAPublicKey key, short offset) throws InvalidArgumentsException, NotEnoughSpaceException {
+        short pos = offset;
+        short len;
+
+        pos += UtilTLV.writeTagAndLen((short)0x7F49, (short)0x100, ram_buf, pos);
+
+        if (SCHSM) {
+            // id-TA-RSA-v1-5-SHA-256 - 0.4.0.127.0.7.2.2.2.1.2
+            len = 10;
+            pos += UtilTLV.writeTagAndLen((short)0x06, len, ram_buf, pos);
+            ram_buf[pos++] = 0x04;
+            ram_buf[pos++] = 0x00;
+            ram_buf[pos++] = 0x7F;
+            ram_buf[pos++] = 0x00;
+            ram_buf[pos++] = 0x07;
+            ram_buf[pos++] = 0x02;
+            ram_buf[pos++] = 0x02;
+            ram_buf[pos++] = 0x02;
+            ram_buf[pos++] = 0x01;
+            ram_buf[pos++] = 0x02;
+        }
+
+        // Public key
+        len = key.getModulus(ram_buf, pos);
+        pos += UtilTLV.writeTagAndLen((short)0x81, len, ram_buf, pos);
+        pos += key.getModulus(ram_buf, pos);
+
+        // Exponent
+        len = key.getExponent(ram_buf, pos);
+        pos += UtilTLV.writeTagAndLen((short)0x82, len, ram_buf, pos);
+        pos += key.getExponent(ram_buf, pos);
+
+        len = (short)(pos - offset - 5);
+        UtilTLV.writeTagAndLen((short)0x7F49, len, ram_buf, offset);
+        pos -= adjustTagPos(ram_buf, (short) 0x7F49, offset, len);
+
+        return pos;
+    }
+
+    /**
+     * \brief Encode a ECPublicKey in a SC-HSM fashion
+     *
+     * \throw InvalidArgumentsException Field length of the RSA key provided can not be handled.
+     *
+     * \throw NotEnoughSpaceException ram_buf is too small to contain the EC key to send.
+     */
+    private short encodeECPublicKey(ECPublicKey key, short offset) throws InvalidArgumentsException, NotEnoughSpaceException {
+        short pos = offset;
+        final short field_bytes = (key.getSize()%8 == 0) ? (short)(key.getSize()/8) : (short)(key.getSize()/8+1);
+        short len, r;
+
+        // Return pubkey. See ISO7816-8 table 3.
+        len = (short)(7 // We have: 7 tags,
+                      + (SCHSM ? 11 : 0) // OID
+                      + (key.getSize() >= LENGTH_EC_FP_512 ? 9 : 7) // 7 length fields, of which 2 are 2 byte fields when using 521 bit curves,
+                      + 8 * field_bytes + 4); // 4 * field_len + 2 * 2 field_len + cofactor (2 bytes) + 2 * uncompressed tag
+        pos += UtilTLV.writeTagAndLen((short)0x7F49, len, ram_buf, pos);
+
+        if (SCHSM) {
+            // id-TA-ECDSA-SHA-256 - 0.4.0.127.0.7.2.2.2.2.3
+            len = 10;
+            pos += UtilTLV.writeTagAndLen((short)0x06, len, ram_buf, pos);
+            ram_buf[pos++] = 0x04;
+            ram_buf[pos++] = 0x00;
+            ram_buf[pos++] = 0x7F;
+            ram_buf[pos++] = 0x00;
+            ram_buf[pos++] = 0x07;
+            ram_buf[pos++] = 0x02;
+            ram_buf[pos++] = 0x02;
+            ram_buf[pos++] = 0x02;
+            ram_buf[pos++] = 0x02;
+            ram_buf[pos++] = 0x03;
+        }
+
+        // Prime - "P"
+        len = field_bytes;
+        pos += UtilTLV.writeTagAndLen((short)0x81, len, ram_buf, pos);
+        r = key.getField(ram_buf, pos);
+        if(r < len) {
+            // If the parameter has fewer bytes than the field length, we fill
+            // the MSB's with zeroes.
+            Util.arrayCopyNonAtomic(ram_buf, pos, ram_buf, (short)(pos+len-r), r);
+            Util.arrayFillNonAtomic(ram_buf, pos, (short)(len-r), (byte)0x00);
+        } else if (r > len) {
+            throw InvalidArgumentsException.getInstance();
+        }
+        pos += len;
+
+        // First coefficient - "A"
+        len = field_bytes;
+        pos += UtilTLV.writeTagAndLen((short)0x82, len, ram_buf, pos);
+        r = key.getA(ram_buf, pos);
+        if(r < len) {
+            Util.arrayCopyNonAtomic(ram_buf, pos, ram_buf, (short)(pos+len-r), r);
+            Util.arrayFillNonAtomic(ram_buf, pos, (short)(len-r), (byte)0x00);
+        } else if (r > len) {
+            throw InvalidArgumentsException.getInstance();
+        }
+        pos += len;
+
+        // Second coefficient - "B"
+        len = field_bytes;
+        pos += UtilTLV.writeTagAndLen((short)0x83, len, ram_buf, pos);
+        r = key.getB(ram_buf, pos);
+        if(r < len) {
+            Util.arrayCopyNonAtomic(ram_buf, pos, ram_buf, (short)(pos+len-r), r);
+            Util.arrayFillNonAtomic(ram_buf, pos, (short)(len-r), (byte)0x00);
+        } else if (r > len) {
+            throw InvalidArgumentsException.getInstance();
+        }
+        pos += len;
+
+        // Generator - "PB"
+        len = (short)(1 + 2 * field_bytes);
+        pos += UtilTLV.writeTagAndLen((short)0x84, len, ram_buf, pos);
+        r = key.getG(ram_buf, pos);
+        if(r < len) {
+            Util.arrayCopyNonAtomic(ram_buf, pos, ram_buf, (short)(pos+len-r), r);
+            Util.arrayFillNonAtomic(ram_buf, pos, (short)(len-r), (byte)0x00);
+        } else if (r > len) {
+            throw InvalidArgumentsException.getInstance();
+        }
+        pos += len;
+
+        // Order - "Q"
+        len = field_bytes;
+        pos += UtilTLV.writeTagAndLen((short)0x85, len, ram_buf, pos);
+        r = key.getR(ram_buf, pos);
+        if(r < len) {
+            Util.arrayCopyNonAtomic(ram_buf, pos, ram_buf, (short)(pos+len-r), r);
+            Util.arrayFillNonAtomic(ram_buf, pos, (short)(len-r), (byte)0x00);
+        } else if (r > len) {
+            throw InvalidArgumentsException.getInstance();
+        }
+        pos += len;
+
+        // Public key - "PP"
+        len = (short)(1 + 2 * field_bytes);
+        pos += UtilTLV.writeTagAndLen((short)0x86, len, ram_buf, pos);
+        r = key.getW(ram_buf, pos);
+        if(r < len) {
+            Util.arrayCopyNonAtomic(ram_buf, pos, ram_buf, (short)(pos+len-r), r);
+            Util.arrayFillNonAtomic(ram_buf, pos, (short)(len-r), (byte)0x00);
+        } else if (r > len) {
+            throw InvalidArgumentsException.getInstance();
+        }
+        pos += len;
+
+        // Cofactor
+        len = 1;
+        pos += UtilTLV.writeTagAndLen((short)0x87, len, ram_buf, pos);
+        ram_buf[pos] = (byte) key.getK();
+        pos += 1;
+
+        return pos;
+    }
+
+    /**
      * \brief Process the MANAGE SECURITY ENVIRONMENT apdu (INS = 22).
      *
      * \attention Only SET is supported. RESTORE will reset the security environment.
@@ -1762,6 +2788,11 @@ public class IsoApplet extends Applet implements ExtendedLength {
         short offset_cdata;
         byte algRef = 0;
         short privKeyRef = -1;
+
+        // Allow MANAGE SECURITY ENVIRONMENT APDU in SCHSM mode only if private key import is enabled
+        if (SCHSM && !private_key_import_allowed) {
+            ISOException.throwIt(SW_COMMAND_NOT_ALLOWED_GENERAL);
+        }
 
         // Check PIN
         if( ! pin.isValidated() ) {
@@ -2307,6 +3338,67 @@ public class IsoApplet extends Applet implements ExtendedLength {
         ISOException.throwIt(ISO7816.SW_INCORRECT_P1P2);
     }
 
+    private void exportConfigSCHSM(APDU apdu) throws InvalidArgumentsException, NotEnoughSpaceException {
+        short pos, len;
+
+        // Reset export private key data
+        ram_chaining_cache[RAM_CHAINING_CACHE_TAGS_SENT] = TAG_NONE;
+
+        if(ENABLE_IMPORT_EXPORT) {
+            if(IMPORT_EXPORT) {
+                if (state != STATE_CREATION && state != STATE_INITIALISATION) {
+                    if (pin.check()) {
+                        fs.setUserAuthenticated(PIN_REF);
+                    }
+                }
+            }
+        }
+
+        pos = 3;
+
+        pos += UtilTLV.writeTagAndLen(TAG_PIN_MAX_TRIES, (short)1, ram_buf, pos);
+        ram_buf[pos++] = pin_max_tries;
+
+        pos += UtilTLV.writeTagAndLen(TAG_KEY_MAX_COUNT, (short)1, ram_buf, pos);
+        ram_buf[pos++] = (byte)key_max_count;
+
+        pos += UtilTLV.writeTagAndLen(TAG_IMPORT_EXPORT, (short)1, ram_buf, pos);
+        ram_buf[pos++] = IMPORT_EXPORT ? (byte)1 : (byte)0;
+
+        pos += UtilTLV.writeTagAndLen(TAG_STATE, (short)1, ram_buf, pos);
+        ram_buf[pos++] = state;
+
+        if(ENABLE_IMPORT_EXPORT) {
+            if(IMPORT_EXPORT) {
+                if (state != STATE_CREATION && state != STATE_INITIALISATION) {
+                    len = pin.copyPIN(ram_buf, pos);
+                    pos += UtilTLV.writeTagAndLen(TAG_PIN, len, ram_buf, pos);
+                    pos += pin.copyPIN(ram_buf, pos);
+                }
+            }
+        }
+
+        if(ENABLE_IMPORT_EXPORT) {
+            if(IMPORT_EXPORT) {
+                if (state != STATE_CREATION) {
+                    len = sopin.copyPIN(ram_buf, pos);
+                    pos += UtilTLV.writeTagAndLen(TAG_SOPIN, len, ram_buf, pos);
+                    pos += sopin.copyPIN(ram_buf, pos);
+                }
+            }
+        }
+
+        /* Write outer tag and adjust for tag length */
+        len = UtilTLV.writeTagAndLen(TAG_CONFIG, (short)(pos - 3), ram_buf, (short)0);
+        if (len != 3) {
+            Util.arrayCopy(ram_buf, (short)3, ram_buf, len, (short)(pos - 3));
+            pos -= (3 - len);
+        }
+
+        apdu.setOutgoing();
+        sendLargeData(apdu, (short)0, pos);
+    }
+
     /**
      * \brief Export global card config data.
      *
@@ -2314,6 +3406,11 @@ public class IsoApplet extends Applet implements ExtendedLength {
     */
     private void exportConfig(APDU apdu) throws InvalidArgumentsException, NotEnoughSpaceException {
         short pos, len;
+
+        if (SCHSM) {
+            exportConfigSCHSM(apdu);
+            return;
+        }
 
         // Reset export private key data
         ram_chaining_cache[RAM_CHAINING_CACHE_TAGS_SENT] = TAG_NONE;
@@ -2678,8 +3775,20 @@ public class IsoApplet extends Applet implements ExtendedLength {
             pos = exportRSAPrivateKey(pos);
 
             // ram_buf now contains complete private key, or whatever could fit in
-            apdu.setOutgoing();
-            sendLargeData(apdu, (short)0, pos);
+            if (SCHSM) {
+                // Extended APDU magic
+                short total_len = (short)(2 + UtilTLV.getLengthFieldLength(tags_len) + tags_len);
+                apdu.setOutgoing();
+                apdu.setOutgoingLength(total_len);
+                while (total_len > 0) {
+                    apdu.sendBytesLong(ram_buf, (short)0, pos);
+                    total_len -= pos;
+                    pos = exportRSAPrivateKey((short)0);
+                }
+            } else {
+                apdu.setOutgoing();
+                sendLargeData(apdu, (short)0, pos);
+            }
 
             break;
         case ALG_GEN_EC:
@@ -3148,6 +4257,9 @@ public class IsoApplet extends Applet implements ExtendedLength {
                     keys[currentPrivateKeyRef[0]].clearKey();
                 }
                 keys[currentPrivateKeyRef[0]] = ecImportPrKey;
+                if (SCHSM && currentPrivateKeyRef[0] == 0x00) {
+                    prk_DevAut = cloneKey(ecImportPrKey, (short)0);
+                }
                 ecImportPrKey = null;
                 if(JCSystem.isObjectDeletionSupported()) {
                     JCSystem.requestObjectDeletion();
@@ -3284,6 +4396,10 @@ public class IsoApplet extends Applet implements ExtendedLength {
         byte p2 = buf[ISO7816.OFFSET_P2];
         short privKeyRef = (short)p2;
 
+        if (SCHSM) {
+            ISOException.throwIt(SW_COMMAND_NOT_ALLOWED_GENERAL);
+        }
+
         if( ! pin.isValidated() ) {
             ISOException.throwIt(ISO7816.SW_SECURITY_STATUS_NOT_SATISFIED);
         }
@@ -3317,6 +4433,10 @@ public class IsoApplet extends Applet implements ExtendedLength {
         byte p1 = buf[ISO7816.OFFSET_P1];
         byte p2 = buf[ISO7816.OFFSET_P2];
 
+        if (SCHSM) {
+            ISOException.throwIt(SW_COMMAND_NOT_ALLOWED_GENERAL);
+        }
+
         if(p1 != 0x00 || p2 != 0x00) {
             ISOException.throwIt(ISO7816.SW_INCORRECT_P1P2);
         }
@@ -3341,6 +4461,251 @@ public class IsoApplet extends Applet implements ExtendedLength {
         fs = new IsoFileSystem();
     }
 
+    /*
+     * \brief Copies EC domain parameters
+     */
+    private void copyDomainParameters(ECKey from, ECKey to, short pos) {
+        to.setA(ram_buf, pos, from.getA(ram_buf, pos));
+        to.setB(ram_buf, pos, from.getB(ram_buf, pos));
+        to.setFieldFP(ram_buf, pos, from.getField(ram_buf, pos));
+        to.setG(ram_buf, pos, from.getG(ram_buf, pos));
+        to.setK(from.getK());
+        to.setR(ram_buf, pos, from.getR(ram_buf, pos));
+    }
+
+    /*
+     * \brief Rreturns a clone of existing EC private key
+     */
+    private ECPrivateKey cloneKey(ECPrivateKey ecKey, short pos) {
+        short primeLen = ecKey.getField(ram_buf, pos);
+        short fieldLen = getEcFpFieldLength(primeLen);
+        short privateLen;
+        ECPrivateKey privKey = (ECPrivateKey) KeyBuilder.buildKey(KeyBuilder.TYPE_EC_FP_PRIVATE, fieldLen, false);
+        copyDomainParameters(ecKey, privKey, pos);
+        privateLen = ecKey.getS(ram_buf, pos);
+        privKey.setS(ram_buf, pos, privateLen);
+        return privKey;
+    }
+
+    /**
+     * \brief Process the ERASE_CARD instruction (INS = 50) in SC-HSM mode
+     * Returns nothing
+     *
+     * \param apdu The ERASE_CARD apdu
+     *
+     * \throw ISOException SW_INCORRECT_P1P2.
+     */
+    private void processEraseCardSCHSM(APDU apdu, short lc, short offset_cdata) {
+        byte[] buf = apdu.getBuffer();
+        byte p1 = buf[ISO7816.OFFSET_P1];
+        byte p2 = buf[ISO7816.OFFSET_P2];
+
+        if (ENABLE_IMPORT_EXPORT) {
+            if (IMPORT_EXPORT) {
+                // Import data
+                if (lc > 2 && buf[offset_cdata] == (byte) 0xCF) {
+                    try {
+                        short posCF, lenCF;
+                        short pos, len;
+
+                        posCF = UtilTLV.findTag(buf, offset_cdata, lc, (byte) 0xCF);
+                        lenCF = UtilTLV.decodeLengthField(buf, ++posCF);
+                        posCF++;
+
+                        prk_DevAut = null;
+                        c_DevAut = null;
+
+                        // Reset file system
+                        if (fs != null) {
+                            try {
+                                fs.clearContents();
+                            } catch (Exception e) {
+                            }
+                            fs = null;
+                        }
+                        fs = new IsoFileSystem();
+
+                        // Clear keys
+                        if (keys != null) {
+                            for (short i = 0; i < key_max_count; i++) {
+                                if(keys[i] != null) {
+                                    keys[i].clearKey();
+                                }
+                                keys[i] = null;
+                            }
+                            keys = null;
+                        }
+
+                        pos = UtilTLV.findTag(buf, posCF, lenCF, TAG_PIN_MAX_TRIES);
+                        len = UtilTLV.decodeLengthField(buf, ++pos);
+                        if(len != 1) {
+                            throw InvalidArgumentsException.getInstance();
+                        }
+                        pin_max_tries = buf[++pos];
+
+                        pos = UtilTLV.findTag(buf, posCF, lenCF, TAG_KEY_MAX_COUNT);
+                        len = UtilTLV.decodeLengthField(buf, ++pos);
+                        if(len != 1) {
+                            throw InvalidArgumentsException.getInstance();
+                        }
+                        key_max_count = buf[++pos];
+                        keys = new Key[key_max_count];
+
+                        pos = UtilTLV.findTag(buf, posCF, lenCF, TAG_IMPORT_EXPORT);
+                        len = UtilTLV.decodeLengthField(buf, ++pos);
+                        if(len != 1) {
+                            throw InvalidArgumentsException.getInstance();
+                        }
+                        IMPORT_EXPORT = buf[++pos] != 0;
+
+                        pos = UtilTLV.findTag(buf, posCF, lenCF, TAG_STATE);
+                        len = UtilTLV.decodeLengthField(buf, ++pos);
+                        if(len != 1) {
+                            throw InvalidArgumentsException.getInstance();
+                        }
+                        state = buf[++pos];
+
+                        try {
+                            pos = UtilTLV.findTag(buf, posCF, lenCF, TAG_PIN);
+                            len = UtilTLV.decodeLengthField(buf, ++pos);
+                            if(len != SCHSM_PIN_LENGTH) {
+                                throw InvalidArgumentsException.getInstance();
+                            }
+                            pin.update(buf, ++pos, SCHSM_PIN_LENGTH);
+                            pin.resetAndUnblock();
+                        } catch (NotFoundException e) {
+                        }
+                        if (pin.check()) {
+                            fs.setUserAuthenticated(SCHSM_PIN_REF);
+                        }
+
+                        try {
+                            pos = UtilTLV.findTag(buf, posCF, lenCF, TAG_SOPIN);
+                            len = UtilTLV.decodeLengthField(buf, ++pos);
+                            if(len != SCHSM_SOPIN_LENGTH) {
+                                throw InvalidArgumentsException.getInstance();
+                            }
+                            sopin.update(buf, ++pos, SCHSM_SOPIN_LENGTH);
+                            sopin.resetAndUnblock();
+                        } catch (NotFoundException e) {
+                        }
+
+                    } catch (Exception e) {
+                        ISOException.throwIt(ISO7816.SW_WRONG_DATA);
+                    }
+                    if(JCSystem.isObjectDeletionSupported()) {
+                        JCSystem.requestObjectDeletion();
+                    }
+                    return;
+                }
+            }
+        }
+
+        // If DevAut key does not yet exist, try to import it from 2F02 file
+        if (state == STATE_CREATION) {
+            byte initData[];
+            short importDataLen = 0;
+            initData = fs.get2F02();
+            if (initData == null || initData.length == 0) {
+                ISOException.throwIt(ISO7816.SW_CONDITIONS_NOT_SATISFIED);
+            }
+            if (initData[0] == (byte) 0x5F && initData[1] == (byte) 0x29) {
+                importDataLen = importDevAutKeySCHSM(initData);
+                keys[0] = cloneKey(prk_DevAut, (short) 0);
+            }
+            if (c_DevAut == null) {
+                c_DevAut = new byte[(short)(initData.length - importDataLen)];
+                Util.arrayCopy(initData, importDataLen, c_DevAut, (short)0, (short)c_DevAut.length);
+                fs.set2F02(c_DevAut);
+            }
+            state = STATE_INITIALISATION;
+            return;
+        } else if (c_DevAut == null) {
+            // We get here after full card import
+            byte initData[] = fs.get2F02();
+            if (initData == null || initData.length == 0) {
+                ISOException.throwIt(ISO7816.SW_CONDITIONS_NOT_SATISFIED);
+            }
+            c_DevAut = new byte[initData.length];
+            Util.arrayCopy(initData, (short)0, c_DevAut, (short)0, (short)c_DevAut.length);
+            return;
+        }
+
+        // Empty init
+        if (lc == 0x16) {
+            ISOException.throwIt(ISO7816.SW_NO_ERROR);
+        }
+
+        if (lc != 0x19) {
+            ISOException.throwIt(ISO7816.SW_WRONG_DATA);
+        }
+
+        // Regular SC-HSM init
+        try {
+            short posSOPin, lenSOPin;
+            short posPin, lenPin;
+
+            // Tag 0x82 - initial SO PIN
+            posSOPin = UtilTLV.findTag(buf, offset_cdata, lc, (byte) 0x82);
+            lenSOPin = UtilTLV.decodeLengthField(buf, ++posSOPin);
+            if(lenSOPin != SCHSM_SOPIN_LENGTH/2) {
+                throw InvalidArgumentsException.getInstance();
+            }
+            if (convertSOPIN_SCHSM(buf, ++posSOPin, ram_buf) != SCHSM_SOPIN_LENGTH) {
+                ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
+            }
+            if (state != STATE_INITIALISATION) {
+                // SO PIN has to be authenticated
+                if (!sopin.check(ram_buf, (byte) 0, SCHSM_SOPIN_LENGTH)) {
+                    ISOException.throwIt(ISO7816.SW_CONDITIONS_NOT_SATISFIED);
+                }
+            }
+            sopin.update(ram_buf, (short) 0, SCHSM_SOPIN_LENGTH);
+            sopin.resetAndUnblock();
+
+            // Tag 0x81 - initial PIN
+            posPin = UtilTLV.findTag(buf, offset_cdata, lc, (byte) 0x81);
+            lenPin = UtilTLV.decodeLengthField(buf, ++posPin);
+            if(lenPin != SCHSM_PIN_LENGTH) {
+                throw InvalidArgumentsException.getInstance();
+            }
+            pin.update(buf, ++posPin, SCHSM_PIN_LENGTH);
+            pin.resetAndUnblock();
+
+            state = STATE_OPERATIONAL_ACTIVATED;
+        } catch (Exception e) {
+            ISOException.throwIt(ISO7816.SW_WRONG_DATA);
+        }
+
+        // Reset file system
+        if (fs != null) {
+            try {
+                fs.clearContents();
+            } catch (Exception e) {
+            }
+            fs = null;
+        }
+        fs = new IsoFileSystem();
+        fs.add2F02(c_DevAut);
+
+        // Clear keys
+        if (keys != null) {
+            for (short i = 0; i < key_max_count; i++) {
+                if(keys[i] != null) {
+                    keys[i].clearKey();
+                }
+            keys[i] = null;
+            }
+            keys = null;
+        }
+        keys = new Key[key_max_count];
+        keys[0] = cloneKey(prk_DevAut, (short) 0);
+
+        if(JCSystem.isObjectDeletionSupported()) {
+            JCSystem.requestObjectDeletion();
+        }
+    }
+
     /**
      * \brief Process the ERASE_CARD instruction (INS = 50).
      * Returns nothing
@@ -3355,6 +4720,11 @@ public class IsoApplet extends Applet implements ExtendedLength {
         byte p2 = buf[ISO7816.OFFSET_P2];
         short lc = apdu.setIncomingAndReceive();
         short offset_cdata = apdu.getOffsetCdata();
+
+        if (SCHSM) {
+            processEraseCardSCHSM(apdu, lc, offset_cdata);
+            return;
+        }
 
         if(p1 != 0x00 || p2 != 0x00) {
             ISOException.throwIt(ISO7816.SW_INCORRECT_P1P2);
@@ -3493,6 +4863,10 @@ public class IsoApplet extends Applet implements ExtendedLength {
         byte p1 = buf[ISO7816.OFFSET_P1];
         byte p2 = buf[ISO7816.OFFSET_P2];
 
+        if (SCHSM) {
+            ISOException.throwIt(SW_COMMAND_NOT_ALLOWED_GENERAL);
+        }
+
         if(p1 == OPT_P1_SERIAL && p2 == 0x00) {
             // Get serial
             short le = apdu.setOutgoing();
@@ -3527,6 +4901,168 @@ public class IsoApplet extends Applet implements ExtendedLength {
             apdu.sendBytes((short) 0, (short) 2);
         } else
             ISOException.throwIt(ISO7816.SW_INCORRECT_P1P2);
+    }
+
+    /**
+     * \brief Process the SCHSM_SIGN instruction (INS = 68).
+     */
+    private void processSignSCHSM(APDU apdu) {
+        byte[] buf = apdu.getBuffer();
+        byte p1 = buf[ISO7816.OFFSET_P1];
+        byte p2 = buf[ISO7816.OFFSET_P2];
+        short lc, le;
+        short sigLen = 0;
+
+        if( ! pin.isValidated() ) {
+            ISOException.throwIt(ISO7816.SW_SECURITY_STATUS_NOT_SATISFIED);
+        }
+
+        lc = doChainingOrExtAPDU(apdu);
+
+        short privKeyRef = p1;
+        if (privKeyRef < 0 || privKeyRef >= key_max_count) {
+            ISOException.throwIt(ISO7816.SW_DATA_INVALID);
+        }
+        if (keys[privKeyRef] == null) {
+            ISOException.throwIt(ISO7816.SW_DATA_INVALID);
+        }
+
+        // Raw RSA
+        if(p2 == (byte) 0x20) {
+            if (!(keys[privKeyRef] instanceof RSAPrivateCrtKey)) {
+                ISOException.throwIt(ISO7816.SW_DATA_INVALID);
+            }
+
+            // RSA signature operation.
+            RSAPrivateCrtKey rsaKey = (RSAPrivateCrtKey) keys[privKeyRef];
+
+            if(lc != (short)(rsaKey.getSize()/8)) {
+                ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
+            }
+
+            rsaPkcs1Cipher.init(rsaKey, Cipher.MODE_ENCRYPT);
+            try {
+                sigLen = rsaPkcs1Cipher.doFinal(ram_buf, (short) 0, lc, ram_buf, (short) 0);
+            } catch(CryptoException e) {
+                ISOException.throwIt(ISO7816.SW_WRONG_DATA);
+            }
+        }
+
+        // ECDSA
+        if(p2 == (byte) 0x70) {
+            if (!(keys[privKeyRef] instanceof ECPrivateKey)) {
+                ISOException.throwIt(ISO7816.SW_DATA_INVALID);
+            }
+
+            if (ecdsaSignaturePrecomp == null) {
+                ISOException.throwIt(ISO7816.SW_FUNC_NOT_SUPPORTED);
+            }
+
+            // ECDSA signature operation.
+            ECPrivateKey ecKey = (ECPrivateKey) keys[privKeyRef];
+
+            // Sign data in one go
+            ecdsaSignaturePrecomp.init(ecKey, Signature.MODE_SIGN);
+            if (ecdsaSHA512) {
+                short fittedLength = fitDataToKeyLength(ecKey.getSize() > 8*MessageDigest.LENGTH_SHA_512 ? 8*MessageDigest.LENGTH_SHA_512 : ecKey.getSize(), ram_buf, (short) 0, lc, ram_buf);
+                sigLen = ecdsaSignaturePrecomp.signPreComputedHash(ram_buf, (short) 0, MessageDigest.LENGTH_SHA_512, ram_buf, (short) 0);
+            } else {
+                sigLen = ecdsaSignaturePrecomp.signPreComputedHash(ram_buf, (short) 0, lc, ram_buf, (short) 0);
+            }
+        }
+
+        if (sigLen == 0) {
+            ISOException.throwIt(ISO7816.SW_DATA_INVALID);
+        }
+
+        // A single short APDU can handle only 256 bytes - we use sendLargeData instead
+        le = apdu.setOutgoing();
+        if(le < sigLen) {
+            ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
+        }
+        sendLargeData(apdu, (short) 0, sigLen);
+    }
+
+    /**
+     * \brief Process the SCHSM_DECIPHER instruction (INS = 62).
+     */
+    private void processDecipherSCHSM(APDU apdu) {
+        byte[] buf = apdu.getBuffer();
+        byte p1 = buf[ISO7816.OFFSET_P1];
+        byte p2 = buf[ISO7816.OFFSET_P2];
+        short lc, le;
+        short decLen = -1;
+
+        if( ! pin.isValidated() ) {
+            ISOException.throwIt(ISO7816.SW_SECURITY_STATUS_NOT_SATISFIED);
+        }
+
+        lc = doChainingOrExtAPDU(apdu);
+
+        short privKeyRef = p1;
+        if (privKeyRef < 0 || privKeyRef >= key_max_count) {
+            ISOException.throwIt(ISO7816.SW_DATA_INVALID);
+        }
+        if (keys[privKeyRef] == null) {
+            ISOException.throwIt(ISO7816.SW_DATA_INVALID);
+        }
+
+        // RSA
+        if(p2 == (byte) 0x21) {
+            if (!(keys[privKeyRef] instanceof RSAPrivateCrtKey)) {
+                ISOException.throwIt(ISO7816.SW_DATA_INVALID);
+            }
+
+            RSAPrivateCrtKey rsaKey = (RSAPrivateCrtKey) keys[privKeyRef];
+
+            // Check the length of the cipher.
+            if(lc !=  (short)(rsaKey.getSize() / 8)) {
+                ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
+            }
+
+            rsaPkcs1Cipher.init(rsaKey, Cipher.MODE_DECRYPT);
+            try {
+                decLen = rsaPkcs1Cipher.doFinal(ram_buf, (short) 0, lc,
+                                                ram_buf, (short) 0);
+            } catch(CryptoException e) {
+                ISOException.throwIt(ISO7816.SW_WRONG_DATA);
+            }
+        }
+
+        // ECDH
+        if(p2 == (byte) 0x80) {
+            if (!(keys[privKeyRef] instanceof ECPrivateKey)) {
+                ISOException.throwIt(ISO7816.SW_DATA_INVALID);
+            }
+
+            if (ecdsaSignaturePrecomp == null) {
+                ISOException.throwIt(ISO7816.SW_FUNC_NOT_SUPPORTED);
+            }
+
+            ECPrivateKey ecKey = (ECPrivateKey) keys[privKeyRef];
+
+            // Perform ECDH
+            // Note: The first byte of the data field is the padding indicator
+            //		 and therefore not part of the data.
+            ecdh.init(ecKey);
+            decLen = ecdh.generateSecret(ram_buf, (short) 0, lc,
+                                         ram_buf, (short) 1);
+
+            ram_buf[0] = 0x04;
+            Util.arrayFillNonAtomic(ram_buf, (short)(decLen + 1), decLen, (byte)0xFF);
+            decLen = (short)(1 + 2*decLen);
+        }
+
+        if (decLen == -1) {
+            ISOException.throwIt(ISO7816.SW_DATA_INVALID);
+        }
+
+        // A single short APDU can handle only 256 bytes - we use sendLargeData instead
+        le = apdu.setOutgoing();
+        if(le < decLen) {
+            ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
+        }
+        sendLargeData(apdu, (short) 0, decLen);
     }
 
 } // class IsoApplet

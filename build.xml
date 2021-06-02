@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<project name="JavaCard PKI isoApplet" default="dist" basedir=".">
+<project name="JavaCard PKI isoApplet/SC-HSM" default="dist" basedir=".">
   <description>Builds the project. </description>
   <target name="dist" description="generate the distribution">
     <tstamp/>
@@ -7,14 +7,14 @@
     <!-- Create the distribution directory -->
     <taskdef name="javacard" classname="pro.javacard.ant.JavaCard" classpath="ext/ant/ant-javacard.jar"/>
     <javacard>
-      <cap jckit="ext/ant/sdks/jc305u3_kit" targetsdk="ext/ant/sdks/jc304_kit" aid="f2:76:a2:88:bc:fb:a6:9d:34:f3:10" output="IsoApplet.cap" sources="src" version="1.0">
-        <applet class="net.pwendland.javacard.pki.isoapplet.IsoApplet" aid="f2:76:a2:88:bc:fb:a6:9d:34:f3:10:01"/>
+      <cap jckit="ext/ant/sdks/jc305u3_kit" targetsdk="ext/ant/sdks/jc304_kit" aid="e8:2b:06:01:04:01:81:c3:1f" output="SC-HSM.cap" sources="src" version="1.0">
+        <applet class="net.pwendland.javacard.pki.isoapplet.IsoApplet" aid="e8:2b:06:01:04:01:81:c3:1f:02:01"/>
         <import exps="ext/globalplatform-2_1_1" jar="ext/globalplatform-2_1_1/gp211.jar"/>
       </cap>
     </javacard>
   </target>
   <target name="clean" description="clean up">
     <!-- Delete the built applet -->
-    <delete file="IsoApplet.cap"/>
+    <delete file="SC-HSM.cap"/>
   </target>
 </project>
